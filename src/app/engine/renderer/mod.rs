@@ -1,5 +1,4 @@
 pub mod context;
-pub mod deletion_queue;
 pub mod swapchain;
 
 use std::sync::Arc;
@@ -8,15 +7,122 @@ use anyhow::{Ok, Result};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use winit::window::Window;
 
-use crate::app::engine::renderer::{
-    context::{AllocatedImage, RenderingContext},
-    deletion_queue::DeletionQueue,
-    swapchain::Swapchain,
+use crate::app::engine::{
+    renderer::{
+        context::{AllocatedImage, RenderingContext},
+        swapchain::Swapchain,
+    },
+    resources,
 };
-use ash::vk::{self, CommandBufferUsageFlags};
+use ash::vk::{self, CommandBufferUsageFlags, ExtendsDescriptorSetLayoutCreateInfo};
+
+pub struct DescriptorLayoutBuilder<'a> {
+    bindings: Vec<vk::DescriptorSetLayoutBinding<'a>>,
+}
+
+impl<'a> DescriptorLayoutBuilder<'a> {
+    fn new() -> Self {
+        Self {
+            bindings: Vec::new(),
+        }
+    }
+
+    fn add_binding(&mut self, binding: u32, desc_type: vk::DescriptorType) {
+        self.bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_count(1)
+                .descriptor_type(desc_type),
+        );
+    }
+
+    fn clear(&mut self) {
+        self.bindings.clear();
+    }
+
+    fn build(
+        &mut self,
+        device: &ash::Device,
+        shader_stages: vk::ShaderStageFlags,
+    ) -> Result<vk::DescriptorSetLayout> {
+        for b in &mut self.bindings {
+            b.stage_flags |= shader_stages
+        }
+
+        unsafe {
+            Ok(device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(&self.bindings)
+                    .flags(vk::DescriptorSetLayoutCreateFlags::empty()),
+                None,
+            )?)
+        }
+    }
+}
+
+struct DescriptorAllocator {
+    pool: vk::DescriptorPool,
+}
+struct PoolSizeRatio {
+    desc_type: vk::DescriptorType,
+    ratio: u32,
+}
+
+impl DescriptorAllocator {
+    fn new(device: &ash::Device, max_sets: u32, pool_ratios: Vec<PoolSizeRatio>) -> Result<Self> {
+        let mut pool_sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
+        for ratio in pool_ratios {
+            pool_sizes.push(vk::DescriptorPoolSize {
+                ty: ratio.desc_type,
+                descriptor_count: ratio.ratio * max_sets,
+            });
+        }
+
+        unsafe {
+            let pool = device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::empty())
+                    .max_sets(max_sets)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )?;
+
+            Ok(Self { pool })
+        }
+    }
+
+    fn clear_descriptors(&self, device: &ash::Device) {
+        unsafe {
+            device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty());
+        }
+    }
+
+    fn destroy_pool(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_descriptor_pool(self.pool, None);
+        }
+    }
+
+    fn allocate(
+        &self,
+        device: &ash::Device,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet> {
+        unsafe {
+            Ok(*device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self.pool)
+                        .set_layouts(&[layout]),
+                )?
+                .iter()
+                .next()
+                .unwrap())
+        }
+    }
+}
 
 pub struct Frame {
-    deletion_queue: DeletionQueue,
     in_flight_fence: vk::Fence,
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
@@ -25,7 +131,11 @@ pub struct Frame {
 }
 
 pub struct Renderer {
-    deletion_queue: DeletionQueue,
+    gradient_pipeline: vk::Pipeline,
+    gradient_pipeline_layout: vk::PipelineLayout,
+    global_descriptor_allocator: DescriptorAllocator,
+    draw_image_descriptors: vk::DescriptorSet,
+    draw_image_descriptor_layout: vk::DescriptorSetLayout,
     frame_number: usize,
     frames: Vec<Frame>,
     swapchain: Swapchain,
@@ -71,7 +181,6 @@ impl Renderer {
                     .unwrap();
 
                 frames.push(Frame {
-                    deletion_queue: DeletionQueue::new(),
                     image_available_semaphore,
                     render_finished_semaphore,
                     in_flight_fence,
@@ -80,8 +189,68 @@ impl Renderer {
                 });
             }
 
+            let sizes = Vec::from([PoolSizeRatio {
+                desc_type: vk::DescriptorType::STORAGE_IMAGE,
+                ratio: 1,
+            }]);
+
+            let global_descriptor_allocator = DescriptorAllocator::new(&context.device, 10, sizes)?;
+            let mut descriptor_layout_builder = DescriptorLayoutBuilder::new();
+            descriptor_layout_builder.add_binding(0, vk::DescriptorType::STORAGE_IMAGE);
+
+            let draw_image_descriptor_layout =
+                descriptor_layout_builder.build(&context.device, vk::ShaderStageFlags::COMPUTE)?;
+
+            let draw_image_descriptors = global_descriptor_allocator
+                .allocate(&context.device, draw_image_descriptor_layout)?;
+
+            context.device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_binding(0)
+                    .dst_set(draw_image_descriptors)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(1)
+                    .image_info(&[vk::DescriptorImageInfo::default()
+                        .image_layout(vk::ImageLayout::GENERAL)
+                        .image_view(swapchain.draw_image.image_view)])],
+                &[],
+            );
+
+            let gradient_pipeline_layout = context.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&[draw_image_descriptor_layout]),
+                None,
+            )?;
+
+            let module = Self::load_shader_module("gradient.comp.spv", &context.device)?;
+
+            let gradient_pipeline = *context
+                .device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .layout(gradient_pipeline_layout)
+                        .stage(
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::COMPUTE)
+                                .module(module)
+                                .name(c"main"),
+                        )],
+                    None,
+                )
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap();
+
+            context.device.destroy_shader_module(module, None);
+
             Ok(Self {
-                deletion_queue: DeletionQueue::new(),
+                gradient_pipeline,
+                gradient_pipeline_layout,
+                global_descriptor_allocator,
+                draw_image_descriptor_layout,
+                draw_image_descriptors,
                 frame_number: 0,
                 frames,
                 swapchain,
@@ -94,6 +263,17 @@ impl Renderer {
         self.swapchain.resize()
     }
 
+    fn load_shader_module(path: &str, device: &ash::Device) -> Result<vk::ShaderModule> {
+        let binary_data = resources::load_binary_u32(path)?;
+
+        unsafe {
+            Ok(device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&binary_data),
+                None,
+            )?)
+        }
+    }
+
     pub fn render(&mut self) -> Result<()> {
         unsafe {
             let frame = &mut self.frames[self.frame_number % FRAME_OVERLAP];
@@ -102,7 +282,6 @@ impl Renderer {
             self.context
                 .device
                 .wait_for_fences(&[frame.in_flight_fence], true, u64::MAX)?;
-            frame.deletion_queue.flush();
 
             self.context.device.reset_fences(&[frame.in_flight_fence])?;
 
@@ -134,19 +313,40 @@ impl Renderer {
                 vk::ImageAspectFlags::COLOR,
             );
 
-            self.context.device.cmd_clear_color_image(
+            /*
+                self.context.device.cmd_clear_color_image(
+                    frame.command_buffer,
+                    self.swapchain.draw_image.image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 1.0],
+                    },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .layer_count(vk::REMAINING_ARRAY_LAYERS)
+                        .base_array_layer(0)
+                        .level_count(vk::REMAINING_MIP_LEVELS)],
+                );
+            */
+            self.context.device.cmd_bind_pipeline(
                 frame.command_buffer,
-                self.swapchain.draw_image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue {
-                    float32: [1.0, 0.0, 0.0, 1.0],
-                },
-                &[vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .layer_count(vk::REMAINING_ARRAY_LAYERS)
-                    .base_array_layer(0)
-                    .level_count(vk::REMAINING_MIP_LEVELS)],
+                vk::PipelineBindPoint::COMPUTE,
+                self.gradient_pipeline,
+            );
+            self.context.device.cmd_bind_descriptor_sets(
+                frame.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.gradient_pipeline_layout,
+                0,
+                &[self.draw_image_descriptors],
+                &[],
+            );
+            self.context.device.cmd_dispatch(
+                frame.command_buffer,
+                self.swapchain.draw_image.extent.width / 16,
+                self.swapchain.draw_image.extent.height / 16,
+                1,
             );
 
             //transition the draw image and the swapchain image into their correct transfer layouts
@@ -237,10 +437,20 @@ impl Drop for Renderer {
                 self.context
                     .device
                     .destroy_command_pool(frame.command_pool, None);
-                self.deletion_queue.flush();
             });
 
-            self.deletion_queue.flush();
+            self.global_descriptor_allocator
+                .destroy_pool(&self.context.device);
+            self.context
+                .device
+                .destroy_descriptor_set_layout(self.draw_image_descriptor_layout, None);
+
+            self.context
+                .device
+                .destroy_pipeline_layout(self.gradient_pipeline_layout, None);
+            self.context
+                .device
+                .destroy_pipeline(self.gradient_pipeline, None);
             /*
             self.context.device.destroy_pipeline(self.pipeline, None);
             self.context

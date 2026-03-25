@@ -1,4 +1,5 @@
 pub mod renderer;
+pub mod resources;
 
 use std::sync::Arc;
 

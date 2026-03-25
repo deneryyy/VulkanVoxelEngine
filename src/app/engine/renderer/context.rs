@@ -1,6 +1,5 @@
 use std::{collections::HashSet, sync::Arc};
 
-use crate::app::engine::renderer::deletion_queue::{self, DeletionQueue};
 use anyhow::{Context, Ok, Result};
 use ash::vk::{self, ImageSubresourceLayers, ImageSubresourceRange};
 use gpu_allocator::vulkan::{Allocation, Allocator, AllocatorCreateDesc};

@@ -87,7 +87,9 @@ impl Swapchain {
         }
 
         unsafe {
-            let surface_capabilities = self.context
+            self.context.device.device_wait_idle();
+            let surface_capabilities = self
+                .context
                 .surface_extension
                 .get_physical_device_surface_capabilities(
                     self.context.physical_device.handle,
@@ -113,7 +115,7 @@ impl Swapchain {
                     .old_swapchain(self.handle),
                 None,
             )?;
-            // Destroying previous image views and swap chain
+            // Destroying previous image views and swapchain
             self.image_views.drain(..).for_each(|image_view| {
                 self.context.device.destroy_image_view(image_view, None);
             });
@@ -121,16 +123,18 @@ impl Swapchain {
             self.context
                 .swapchain_extension
                 .destroy_swapchain(self.handle, None);
+
+            // Destroying draw image
             /*
-                        self.context
-                            .device
-                            .destroy_image(self.draw_image.image, None);
-                        self.context
-                            .device
-                            .destroy_image_view(self.draw_image.image_view, None);
-                        self.allocator
-                            .free(std::mem::take(&mut self.draw_image.allocation))
-                            .unwrap();
+            self.context
+                .device
+                .destroy_image(self.draw_image.image, None);
+            self.context
+                .device
+                .destroy_image_view(self.draw_image.image_view, None);
+            self.allocator
+                .free(std::mem::take(&mut self.draw_image.allocation))
+                .unwrap();
             */
             // getting new ones
             self.handle = new_swapchain;
@@ -145,6 +149,14 @@ impl Swapchain {
                     vk::ImageAspectFlags::COLOR,
                 )?);
             }
+
+            /*
+            self.draw_image = Self::create_draw_image(
+                self.window.clone(),
+                self.context.clone(),
+                &mut self.allocator,
+            )?;
+            */
         }
 
         Ok(())
