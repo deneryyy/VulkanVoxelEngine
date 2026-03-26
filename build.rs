@@ -30,6 +30,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=res/*");
 
     compile_and_output_shader("res/gradient.comp", "gradient.comp", "res/gradient.comp.spv", ShaderKind::Compute)?;
+    compile_and_output_shader("res/shader.frag", "shader.frag", "res/shader.frag.spv", ShaderKind::Fragment)?;
+    compile_and_output_shader("res/shader.vert", "shader.vert", "res/shader.vert.spv", ShaderKind::Vertex)?;
 
     let out_dir = env::var("OUT_DIR")?;
     let mut copy_options = CopyOptions::new();

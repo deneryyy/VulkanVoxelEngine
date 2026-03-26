@@ -131,8 +131,8 @@ pub struct Frame {
 }
 
 pub struct Renderer {
-    gradient_pipeline: vk::Pipeline,
-    gradient_pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
     global_descriptor_allocator: DescriptorAllocator,
     draw_image_descriptors: vk::DescriptorSet,
     draw_image_descriptor_layout: vk::DescriptorSetLayout,
@@ -204,6 +204,7 @@ impl Renderer {
             let draw_image_descriptors = global_descriptor_allocator
                 .allocate(&context.device, draw_image_descriptor_layout)?;
 
+                /*
             context.device.update_descriptor_sets(
                 &[vk::WriteDescriptorSet::default()
                     .dst_binding(0)
@@ -214,40 +215,30 @@ impl Renderer {
                         .image_layout(vk::ImageLayout::GENERAL)
                         .image_view(swapchain.draw_image.image_view)])],
                 &[],
-            );
+            );*/
 
-            let gradient_pipeline_layout = context.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&[draw_image_descriptor_layout]),
-                None,
-            )?;
-
-            let module = Self::load_shader_module("gradient.comp.spv", &context.device)?;
-
-            let gradient_pipeline = *context
+            let pipeline_layout = context
                 .device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .layout(gradient_pipeline_layout)
-                        .stage(
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::COMPUTE)
-                                .module(module)
-                                .name(c"main"),
-                        )],
-                    None,
-                )
-                .unwrap()
-                .iter()
-                .next()
-                .unwrap();
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
 
-            context.device.destroy_shader_module(module, None);
+            let vertex_shader = Self::load_shader_module("shader.vert.spv", &context.device)?;
+            let fragment_shader = Self::load_shader_module("shader.frag.spv", &context.device)?;
+            let pipeline = context.create_graphics_pipeline(
+                vk::Extent2D::default()
+                    .width(swapchain.draw_image.extent.width)
+                    .height(swapchain.draw_image.extent.height),
+                swapchain.draw_image.image_format,
+                vertex_shader,
+                fragment_shader,
+                pipeline_layout,
+                Default::default(),
+            )?;
+            context.device.destroy_shader_module(vertex_shader, None);
+            context.device.destroy_shader_module(fragment_shader, None);
 
             Ok(Self {
-                gradient_pipeline,
-                gradient_pipeline_layout,
+                pipeline,
+                pipeline_layout,
                 global_descriptor_allocator,
                 draw_image_descriptor_layout,
                 draw_image_descriptors,
@@ -264,7 +255,7 @@ impl Renderer {
     }
 
     fn load_shader_module(path: &str, device: &ash::Device) -> Result<vk::ShaderModule> {
-        let binary_data = resources::load_binary_u32(path)?;
+        let binary_data = resources::load_spirv(path)?;
 
         unsafe {
             Ok(device.create_shader_module(
@@ -313,31 +304,54 @@ impl Renderer {
                 vk::ImageAspectFlags::COLOR,
             );
 
+            let extent = vk::Extent2D::default()
+                    .width(self.swapchain.draw_image.extent.width)
+                    .height(self.swapchain.draw_image.extent.height);
+
+            self.context.begin_rendering(
+                frame.command_buffer,
+                self.swapchain.draw_image.image_view,
+                vk::ClearColorValue {
+                    float32: [1.0, 0.0, 0.0, 1.0],
+                },
+                vk::Rect2D::default().extent(extent),
+            );
+
+            self.context.device.cmd_set_viewport(
+                frame.command_buffer,
+                0,
+                &[vk::Viewport::default()
+                    .width(extent.width as f32)
+                    .height(extent.height as f32)],
+            );
+
+            self.context.device.cmd_set_scissor(
+                frame.command_buffer,
+                0,
+                &[vk::Rect2D::default().extent(extent)],
+            );
+
+            self.context.device.cmd_bind_pipeline(
+                frame.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
+            );
+
+            self.context
+                .device
+                .cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+
+            self.context.device.cmd_end_rendering(frame.command_buffer);
             /*
-                self.context.device.cmd_clear_color_image(
-                    frame.command_buffer,
-                    self.swapchain.draw_image.image,
-                    vk::ImageLayout::GENERAL,
-                    &vk::ClearColorValue {
-                        float32: [1.0, 0.0, 0.0, 1.0],
-                    },
-                    &[vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(0)
-                        .layer_count(vk::REMAINING_ARRAY_LAYERS)
-                        .base_array_layer(0)
-                        .level_count(vk::REMAINING_MIP_LEVELS)],
-                );
-            */
             self.context.device.cmd_bind_pipeline(
                 frame.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
-                self.gradient_pipeline,
+                self.pipeline,
             );
             self.context.device.cmd_bind_descriptor_sets(
                 frame.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
-                self.gradient_pipeline_layout,
+                self.pipeline_layout,
                 0,
                 &[self.draw_image_descriptors],
                 &[],
@@ -348,6 +362,7 @@ impl Renderer {
                 self.swapchain.draw_image.extent.height / 16,
                 1,
             );
+            */
 
             //transition the draw image and the swapchain image into their correct transfer layouts
             self.context.transition_image_layout(
@@ -447,10 +462,8 @@ impl Drop for Renderer {
 
             self.context
                 .device
-                .destroy_pipeline_layout(self.gradient_pipeline_layout, None);
-            self.context
-                .device
-                .destroy_pipeline(self.gradient_pipeline, None);
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.context.device.destroy_pipeline(self.pipeline, None);
             /*
             self.context.device.destroy_pipeline(self.pipeline, None);
             self.context

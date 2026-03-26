@@ -87,7 +87,7 @@ impl Swapchain {
         }
 
         unsafe {
-            self.context.device.device_wait_idle();
+            self.context.device.device_wait_idle()?;
             let surface_capabilities = self
                 .context
                 .surface_extension
@@ -125,7 +125,6 @@ impl Swapchain {
                 .destroy_swapchain(self.handle, None);
 
             // Destroying draw image
-            /*
             self.context
                 .device
                 .destroy_image(self.draw_image.image, None);
@@ -135,7 +134,6 @@ impl Swapchain {
             self.allocator
                 .free(std::mem::take(&mut self.draw_image.allocation))
                 .unwrap();
-            */
             // getting new ones
             self.handle = new_swapchain;
             self.images = self
@@ -150,13 +148,11 @@ impl Swapchain {
                 )?);
             }
 
-            /*
             self.draw_image = Self::create_draw_image(
                 self.window.clone(),
                 self.context.clone(),
                 &mut self.allocator,
             )?;
-            */
         }
 
         Ok(())

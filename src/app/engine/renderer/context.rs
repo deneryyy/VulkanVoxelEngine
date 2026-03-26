@@ -1,3 +1,4 @@
+use core::ffi;
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Ok, Result};
@@ -362,6 +363,107 @@ impl RenderingContext {
                                 .base_array_layer(0)
                                 .layer_count(1),
                         )]),
+            );
+        }
+    }
+
+    pub fn create_graphics_pipeline(
+        &self,
+        swapchain_extent: vk::Extent2D,
+        swapchain_format: vk::Format,
+        vertex_shader: vk::ShaderModule,
+        fragment_shader: vk::ShaderModule,
+        pipeline_layout: vk::PipelineLayout,
+        pipeline_cache: vk::PipelineCache,
+    ) -> Result<vk::Pipeline> {
+        let entry_point = std::ffi::CString::new("main")?;
+
+        unsafe {
+            Ok(self
+                .device
+                .create_graphics_pipelines(
+                    pipeline_cache,
+                    &[vk::GraphicsPipelineCreateInfo::default()
+                        .stages(&[
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::VERTEX)
+                                .module(vertex_shader)
+                                .name(&entry_point),
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::FRAGMENT)
+                                .module(fragment_shader)
+                                .name(&entry_point),
+                        ])
+                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                        .input_assembly_state(
+                            &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+                        )
+                        .viewport_state(
+                            &vk::PipelineViewportStateCreateInfo::default()
+                                .viewports(&[vk::Viewport::default()
+                                    .width(swapchain_extent.width as f32)
+                                    .height(swapchain_extent.height as f32)
+                                    .max_depth(1.0)])
+                                .scissors(&[vk::Rect2D::default().extent(swapchain_extent)]),
+                        )
+                        .rasterization_state(
+                            &vk::PipelineRasterizationStateCreateInfo::default()
+                                .polygon_mode(vk::PolygonMode::FILL)
+                                .cull_mode(vk::CullModeFlags::NONE)
+                                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                                .line_width(1.0),
+                        )
+                        .multisample_state(
+                            &vk::PipelineMultisampleStateCreateInfo::default()
+                                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                        )
+                        .color_blend_state(
+                            &vk::PipelineColorBlendStateCreateInfo::default().attachments(&[
+                                vk::PipelineColorBlendAttachmentState::default()
+                                    .color_write_mask(vk::ColorComponentFlags::RGBA)
+                                    .blend_enable(false),
+                            ]),
+                        )
+                        .dynamic_state(
+                            &vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
+                                vk::DynamicState::VIEWPORT,
+                                vk::DynamicState::SCISSOR,
+                            ]),
+                        )
+                        .layout(pipeline_layout)
+                        .push_next(
+                            &mut vk::PipelineRenderingCreateInfo::default()
+                                .color_attachment_formats(&[swapchain_format]),
+                        )],
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap())
+        }
+    }
+
+    pub fn begin_rendering(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        view: vk::ImageView,
+        clear_color: vk::ClearColorValue,
+        render_area: vk::Rect2D,
+    ) {
+        unsafe {
+            self.device.cmd_begin_rendering(
+                command_buffer,
+                &vk::RenderingInfo::default()
+                    .layer_count(1)
+                    .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .clear_value(vk::ClearValue { color: clear_color })
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)])
+                    .render_area(render_area),
             );
         }
     }
