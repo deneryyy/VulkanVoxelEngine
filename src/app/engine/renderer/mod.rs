@@ -8,8 +8,8 @@ use std::{sync::Arc, u32};
 use anyhow::{Ok, Result};
 use glam::Mat4;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
-use winit::window::Window;
 use std::result::Result::Ok as stdOk;
+use winit::window::Window;
 
 use crate::app::engine::{
     renderer::{
@@ -240,11 +240,7 @@ impl Renderer {
                 gpu_allocator::MemoryLocation::CpuToGpu,
             )?;
             let data = staging.allocation.mapped_ptr().unwrap().as_ptr();
-            std::ptr::copy_nonoverlapping(
-                vertices.as_ptr(),
-                data.cast(),
-                vertices.len(),
-            );
+            std::ptr::copy_nonoverlapping(vertices.as_ptr(), data.cast(), vertices.len());
 
             let cmd = Self::begin_immediate_submit(context.clone(), imm_fence, imm_command_buffer)?;
             context.device.cmd_copy_buffer(
@@ -352,15 +348,22 @@ impl Renderer {
                 .device
                 .wait_for_fences(&[frame.in_flight_fence], true, u64::MAX)?;
 
-            self.context.device.reset_fences(&[frame.in_flight_fence])?;
 
             if self.swapchain.is_dirty {
                 self.swapchain.resize()?;
             }
 
-            let image_index = self
+            let image_index_result = self
                 .swapchain
-                .acquire_next_image(frame.image_available_semaphore)?;
+                .acquire_next_image(frame.image_available_semaphore);
+
+            if image_index_result.is_err() {
+                self.swapchain.resize()?;
+                return Ok(());
+            }
+            let image_index = image_index_result?;
+
+            self.context.device.reset_fences(&[frame.in_flight_fence])?;
 
             self.context
                 .device
