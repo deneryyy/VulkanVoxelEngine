@@ -197,15 +197,13 @@ impl Swapchain {
                 .get_image_memory_requirements(draw_image_handle)
         };
 
-        let allocation = allocator
-            .allocate(&AllocationCreateDesc {
-                name: "My Image Allocation",
-                requirements,
-                location: MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-            })
-            .unwrap();
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name: "Draw Image",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
 
         unsafe {
             context.device.bind_image_memory(

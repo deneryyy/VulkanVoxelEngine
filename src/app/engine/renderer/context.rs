@@ -2,8 +2,11 @@ use core::ffi;
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Ok, Result};
-use ash::vk::{self, ImageSubresourceLayers, ImageSubresourceRange};
-use gpu_allocator::vulkan::{Allocation, Allocator, AllocatorCreateDesc};
+use ash::vk::{self, BufferCreateInfo, ImageSubresourceLayers, ImageSubresourceRange};
+use gpu_allocator::{
+    MemoryLocation,
+    vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
+};
 use winit::{
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
     window::Window,
@@ -44,6 +47,11 @@ pub struct AllocatedImage {
     pub allocation: Allocation,
     pub extent: vk::Extent3D,
     pub image_format: vk::Format,
+}
+
+pub struct AllocatedBuffer {
+    pub buffer: vk::Buffer,
+    pub allocation: Allocation,
 }
 
 pub struct RenderingContext {
@@ -326,11 +334,7 @@ impl RenderingContext {
                     .filter(vk::Filter::LINEAR)
                     .regions(&[vk::ImageBlit2::default()
                         .src_offsets([
-                            vk::Offset3D {
-                                x: 0,
-                                y: 0,
-                                z: 0,
-                            },
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
                             vk::Offset3D {
                                 x: src_size.width as i32,
                                 y: src_size.height as i32,
@@ -338,11 +342,7 @@ impl RenderingContext {
                             },
                         ])
                         .dst_offsets([
-                            vk::Offset3D {
-                                x: 0,
-                                y: 0,
-                                z: 0,
-                            },
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
                             vk::Offset3D {
                                 x: dst_size.width as i32,
                                 y: dst_size.height as i32,
@@ -466,6 +466,39 @@ impl RenderingContext {
                     .render_area(render_area),
             );
         }
+    }
+
+    pub fn create_buffer(
+        &self,
+        allocator: &mut Allocator,
+        alloc_size: u64,
+        usage: vk::BufferUsageFlags,
+        location: MemoryLocation,
+    ) -> Result<AllocatedBuffer> {
+        unsafe {
+            let buffer = self.device.create_buffer(
+                &BufferCreateInfo::default().usage(usage).size(alloc_size),
+                None,
+            )?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let allocation = allocator.allocate(&AllocationCreateDesc {
+                name: "Buffer",
+                requirements,
+                location,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })?;
+
+            self.device.bind_buffer_memory(buffer, allocation.memory(), 0)?;
+            Ok(AllocatedBuffer { buffer, allocation })
+        }
+    }
+
+    pub fn destroy_buffer(&self, allocator: &mut Allocator, buffer: &mut AllocatedBuffer) {
+        allocator
+            .free(std::mem::take(&mut buffer.allocation))
+            .unwrap();
+        unsafe { self.device.destroy_buffer(buffer.buffer, None) };
     }
 }
 

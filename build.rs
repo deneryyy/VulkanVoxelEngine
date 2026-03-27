@@ -29,7 +29,6 @@ fn main() -> Result<()> {
     // This tells Cargo to rerun this script if something in /res/ changes.
     println!("cargo:rerun-if-changed=res/*");
 
-    compile_and_output_shader("res/gradient.comp", "gradient.comp", "res/gradient.comp.spv", ShaderKind::Compute)?;
     compile_and_output_shader("res/shader.frag", "shader.frag", "res/shader.frag.spv", ShaderKind::Fragment)?;
     compile_and_output_shader("res/shader.vert", "shader.vert", "res/shader.vert.spv", ShaderKind::Vertex)?;
 
