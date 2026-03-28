@@ -3,10 +3,11 @@
 
 struct Vertex {
 	vec3 position;
+	vec3 normal;
 	vec3 color;
 }; 
 
-layout(buffer_reference, std430) readonly buffer VertexBuffer{ 
+layout(buffer_reference, std430) readonly buffer VertexBuffer { 
 	Vertex vertices[];
 };
 
@@ -24,6 +25,6 @@ void main() {
     Vertex v = PushConstants.vertexBuffer.vertices[gl_VertexIndex];
 
 	//output data
-	gl_Position = PushConstants.render_matrix * vec4(v.position, 1.0F);
+	gl_Position = /*PushConstants.render_matrix * */vec4(v.position, 1.0F);
     fragColor = v.color;
 }

@@ -485,11 +485,11 @@ impl RenderingContext {
                 name: "Buffer",
                 requirements,
                 location,
-                linear: false,
+                linear: true,
                 allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             })?;
 
-            self.device.bind_buffer_memory(buffer, allocation.memory(), 0)?;
+            self.device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
             Ok(AllocatedBuffer { buffer, allocation })
         }
     }

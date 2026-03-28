@@ -7,7 +7,10 @@ use std::{sync::Arc, u32};
 
 use anyhow::{Ok, Result};
 use glam::Mat4;
-use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
+use gpu_allocator::{
+    AllocatorDebugSettings,
+    vulkan::{Allocator, AllocatorCreateDesc},
+};
 use std::result::Result::Ok as stdOk;
 use winit::window::Window;
 
@@ -32,10 +35,11 @@ pub struct Frame {
 
 struct GPUMeshBuffers {
     vertex_buffer_address: vk::DeviceAddress,
-    //index_buffer: AllocatedBuffer,
+    index_buffer: AllocatedBuffer,
     vertex_buffer: AllocatedBuffer,
 }
 
+#[repr(C, align(16))]
 struct GPUDrawPushConstants {
     world_matrix: glam::Mat4,
     vertex_buffer: vk::DeviceAddress,
@@ -44,7 +48,6 @@ struct GPUDrawPushConstants {
 pub struct Renderer {
     allocator: Allocator,
     gpu_mesh_buffers: GPUMeshBuffers,
-    vertices: Vec<Vertex>,
     imm_fence: vk::Fence,
     imm_command_buffer: vk::CommandBuffer,
     imm_command_pool: vk::CommandPool,
@@ -183,26 +186,14 @@ impl Renderer {
                 None,
             )?;
 
-            let vertices = Vec::from([
-                Vertex {
-                    pos: [0.0, -0.5, 0.0],
-                    color: [1.0, 0.0, 0.0],
-                    pad1: 0.0,
-                    pad2: 0.0,
-                },
-                Vertex {
-                    pos: [0.5, 0.5, 0.0],
-                    color: [0.0, 1.0, 0.0],
-                    pad1: 0.0,
-                    pad2: 0.0,
-                },
-                Vertex {
-                    pos: [-0.5, 0.5, 0.0],
-                    color: [0.0, 0.0, 1.0],
-                    pad1: 0.0,
-                    pad2: 0.0,
-                },
-            ]);
+            let vertices = &[
+                Vertex::new([-0.5, -0.5, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]),
+                Vertex::new([0.5, -0.5, 0.0], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5]),
+                Vertex::new([0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]),
+                Vertex::new([-0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            ];
+            let indices: &[u32] = &[0, 1, 2, 2, 3, 0];
+
             let mut allocator = Allocator::new(&AllocatorCreateDesc {
                 instance: context.instance.clone(),
                 device: context.device.clone(),
@@ -211,6 +202,7 @@ impl Renderer {
                 buffer_device_address: true,
                 allocation_sizes: Default::default(),
             })?;
+
             let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as u64;
 
             let vertex_buffer = context.create_buffer(
@@ -221,28 +213,32 @@ impl Renderer {
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 gpu_allocator::MemoryLocation::GpuOnly,
             )?;
-            /*
+
+            let index_buffer_size = (indices.len() * std::mem::size_of::<u32>()) as u64;
             let index_buffer = context.create_buffer(
                 &mut allocator,
-                (vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+                index_buffer_size,
                 vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuOnly,
             )?;
-            */
-            let vertex_buffer_address = context.device.get_buffer_device_address(
-                &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
-            );
 
             let mut staging = context.create_buffer(
                 &mut allocator,
-                vertex_buffer_size,
+                vertex_buffer_size + index_buffer_size,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 gpu_allocator::MemoryLocation::CpuToGpu,
             )?;
+
             let data = staging.allocation.mapped_ptr().unwrap().as_ptr();
-            std::ptr::copy_nonoverlapping(vertices.as_ptr(), data.cast(), vertices.len());
+            std::ptr::copy(vertices.as_ptr(), data.cast(), vertices.len());
+            std::ptr::copy(
+                indices.as_ptr(),
+                data.cast::<u32>().byte_add(vertex_buffer_size as usize),
+                indices.len(),
+            );
 
             let cmd = Self::begin_immediate_submit(context.clone(), imm_fence, imm_command_buffer)?;
+
             context.device.cmd_copy_buffer(
                 cmd,
                 staging.buffer,
@@ -252,19 +248,58 @@ impl Renderer {
                     .src_offset(0)
                     .size(vertex_buffer_size)],
             );
-            Self::end_immediate_submit(context.clone(), imm_fence, imm_command_buffer)?;
+            context.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&[
+                    vk::BufferMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(vertex_buffer.buffer)
+                        .size(vertex_buffer_size),
+                ]),
+            );
+            context.device.cmd_copy_buffer(
+                cmd,
+                staging.buffer,
+                index_buffer.buffer,
+                &[vk::BufferCopy::default()
+                    .dst_offset(0)
+                    .src_offset(vertex_buffer_size)
+                    .size(index_buffer_size)],
+            );
+            context.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&[
+                    vk::BufferMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
+                        .dst_access_mask(vk::AccessFlags2::INDEX_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(index_buffer.buffer)
+                        .size(index_buffer_size),
+                ]),
+            );
 
+            Self::end_immediate_submit(context.clone(), imm_fence, imm_command_buffer)?;
+            let vertex_buffer_address = context.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
+            );
             context.destroy_buffer(&mut allocator, &mut staging);
             let gpu_mesh_buffers = GPUMeshBuffers {
                 vertex_buffer_address,
                 vertex_buffer,
-                //index_buffer,
+                index_buffer,
             };
 
             Ok(Self {
                 allocator,
                 gpu_mesh_buffers,
-                vertices,
                 imm_fence,
                 imm_command_buffer,
                 imm_command_pool,
@@ -348,7 +383,6 @@ impl Renderer {
                 .device
                 .wait_for_fences(&[frame.in_flight_fence], true, u64::MAX)?;
 
-
             if self.swapchain.is_dirty {
                 self.swapchain.resize()?;
             }
@@ -381,7 +415,7 @@ impl Renderer {
                 frame.command_buffer,
                 self.swapchain.draw_image.image,
                 vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
             );
 
@@ -432,10 +466,16 @@ impl Renderer {
                     std::mem::size_of::<GPUDrawPushConstants>(),
                 ),
             );
+            self.context.device.cmd_bind_index_buffer(
+                frame.command_buffer,
+                self.gpu_mesh_buffers.index_buffer.buffer,
+                0,
+                vk::IndexType::UINT32,
+            );
 
             self.context
                 .device
-                .cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+                .cmd_draw_indexed(frame.command_buffer, 6, 1, 0, 0, 0);
 
             self.context.device.cmd_end_rendering(frame.command_buffer);
 
@@ -443,7 +483,7 @@ impl Renderer {
             self.context.transition_image_layout(
                 frame.command_buffer,
                 self.swapchain.draw_image.image,
-                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
             );
@@ -549,6 +589,8 @@ impl Drop for Renderer {
                 &mut self.allocator,
                 &mut self.gpu_mesh_buffers.vertex_buffer,
             );
+            self.context
+                .destroy_buffer(&mut self.allocator, &mut self.gpu_mesh_buffers.index_buffer);
             /*
             self.context.device.destroy_pipeline(self.pipeline, None);
             self.context
