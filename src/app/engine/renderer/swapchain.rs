@@ -71,7 +71,7 @@ impl Swapchain {
             surface,
             window,
             context,
-            is_dirty: true,
+            is_dirty: false,
         })
     }
 

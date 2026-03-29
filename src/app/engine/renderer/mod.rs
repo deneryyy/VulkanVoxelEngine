@@ -1,22 +1,24 @@
+pub mod camera;
 pub mod context;
 pub mod descriptor;
-pub mod swapchain;
 pub mod model;
+pub mod swapchain;
 pub mod vertex;
 
 use std::{sync::Arc, u32};
 
 use anyhow::{Ok, Result};
-use glam::Mat4;
+use glam::{Mat4, Vec3, Vec3Swizzles};
 use gpu_allocator::{
     AllocatorDebugSettings,
     vulkan::{Allocator, AllocatorCreateDesc},
 };
 use std::result::Result::Ok as stdOk;
-use winit::window::Window;
+use winit::{event::{ElementState, KeyEvent}, keyboard::KeyCode, window::Window};
 
 use crate::app::engine::{
     renderer::{
+        camera::Camera,
         context::{AllocatedBuffer, AllocatedImage, RenderingContext},
         descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
         swapchain::Swapchain,
@@ -55,6 +57,7 @@ struct UniformBufferObject {
 
 pub struct Renderer {
     allocator: Allocator,
+    camera: Camera,
     gpu_mesh_buffers: GPUMeshBuffers,
     imm_fence: vk::Fence,
     imm_command_buffer: vk::CommandBuffer,
@@ -89,10 +92,12 @@ impl Renderer {
             desc_type: vk::DescriptorType::UNIFORM_BUFFER,
             ratio: 1,
         }]);
-        let global_descriptor_allocator = DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32, sizes)?;
+        let global_descriptor_allocator =
+            DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32, sizes)?;
 
         unsafe {
-            let mut render_finished_semaphores: Vec<vk::Semaphore> = Vec::with_capacity(swapchain.images.len() as usize);
+            let mut render_finished_semaphores: Vec<vk::Semaphore> =
+                Vec::with_capacity(swapchain.images.len() as usize);
             for i in 0..swapchain.images.len() {
                 let render_finished_semaphore = context
                     .device
@@ -105,7 +110,7 @@ impl Renderer {
                 let image_available_semaphore = context
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-               let in_flight_fence = context.device.create_fence(
+                let in_flight_fence = context.device.create_fence(
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                     None,
                 )?;
@@ -321,8 +326,25 @@ impl Renderer {
                 index_buffer,
             };
 
+            let camera = Camera::new(
+                Vec3 {
+                    x: 2.0,
+                    y: 2.0,
+                    z: 2.0,
+                },
+                Vec3 {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                225.0,
+                -37.0,
+                0.0,
+            );
+
             Ok(Self {
                 allocator,
+                camera,
                 gpu_mesh_buffers,
                 imm_fence,
                 imm_command_buffer,
@@ -400,33 +422,19 @@ impl Renderer {
     pub fn render(&mut self) -> Result<()> {
         unsafe {
             let frame = &mut self.frames[self.frame_number % FRAME_OVERLAP];
-
-            let ubo = UniformBufferObject {
-                model: glam::Mat4::from_rotation_x(45.0 + (self.frame_number as f32) * 0.01),
-                view: glam::Mat4::look_at_lh(
-                    glam::Vec3 {
-                        x: 2.0,
-                        y: 2.0,
-                        z: 2.0,
-                    },
-                    glam::Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    glam::Vec3 {
-                        x: 0.0,
-                        y: 1.0,
-                        z: 0.0,
-                    },
-                ),
-                proj: glam::Mat4::perspective_lh(
+            let mut proj =  glam::Mat4::perspective_rh(
                     45.0,
                     self.swapchain.draw_image.extent.width as f32
                         / self.swapchain.draw_image.extent.height as f32,
                     0.0,
                     1000.0,
-                ),
+                );
+            proj.y_axis.y *= -1.0;
+
+            let ubo = UniformBufferObject {
+                model: glam::Mat4::from_rotation_x(45.0 + (self.frame_number as f32) * 0.01),
+                view: self.camera.get_view_matrix(),
+                proj,
             };
             let ubo_ptr = frame
                 .uniform_buffer
@@ -611,8 +619,13 @@ impl Renderer {
         }
     }
 
-    //fn get_current_frame(&self) -> Result<Frame> {
-    //}
+    pub fn process_camera_rotation(&mut self, x: f32, y: f32) {
+        self.camera.process_mouse_movement(x, y);
+    }
+
+    pub fn process_camera_input(&mut self, key: KeyCode, state: ElementState) {
+        self.camera.process_key_movement(key, state);
+    }
 }
 
 impl Drop for Renderer {
@@ -620,17 +633,17 @@ impl Drop for Renderer {
         unsafe {
             self.context.device.device_wait_idle().unwrap();
 
-            self.render_finished_semaphores.drain(..).for_each(|semaphore| {
-                self.context
-                    .device
-                    .destroy_semaphore(semaphore, None);
-            });
+            self.render_finished_semaphores
+                .drain(..)
+                .for_each(|semaphore| {
+                    self.context.device.destroy_semaphore(semaphore, None);
+                });
 
             self.frames.drain(..).for_each(|mut frame| {
                 self.context
                     .device
                     .destroy_semaphore(frame.image_available_semaphore, None);
-               self.context
+                self.context
                     .device
                     .destroy_fence(frame.in_flight_fence, None);
                 self.context

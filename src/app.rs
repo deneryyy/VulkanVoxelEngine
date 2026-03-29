@@ -15,6 +15,17 @@ impl ApplicationHandler for App {
         self.engine = Some(Engine::new(event_loop).unwrap());
     }
 
+    fn device_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.device_event(event_loop, device_id, event);
+        }
+    }
+
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
