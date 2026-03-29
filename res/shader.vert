@@ -14,9 +14,14 @@ layout(buffer_reference, std430) readonly buffer VertexBuffer {
 //push constants block
 layout( push_constant ) uniform constants
 {	
-	mat4 render_matrix;
 	VertexBuffer vertexBuffer;
 } PushConstants;
+
+layout(set = 0, binding = 0) uniform UniformBufferObject {
+    mat4 model;
+    mat4 view;
+    mat4 proj;
+} ubo;
 
 layout(location = 0) out vec3 fragColor;
 
@@ -25,6 +30,6 @@ void main() {
     Vertex v = PushConstants.vertexBuffer.vertices[gl_VertexIndex];
 
 	//output data
-	gl_Position = /*PushConstants.render_matrix * */vec4(v.position, 1.0F);
+	gl_Position =  ubo.proj * ubo.view * ubo.model * vec4(v.position, 1.0F);
     fragColor = v.color;
 }

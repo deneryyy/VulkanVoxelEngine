@@ -1,6 +1,7 @@
 pub mod context;
 pub mod descriptor;
 pub mod swapchain;
+pub mod model;
 pub mod vertex;
 
 use std::{sync::Arc, u32};
@@ -26,9 +27,11 @@ use crate::app::engine::{
 use ash::vk::{self, CommandBufferUsageFlags, ExtendsDescriptorSetLayoutCreateInfo};
 
 pub struct Frame {
+    uniform_buffer_descriptors: vk::DescriptorSet,
+    uniform_buffer_descriptor_layout: vk::DescriptorSetLayout,
+    uniform_buffer: AllocatedBuffer,
     in_flight_fence: vk::Fence,
     image_available_semaphore: vk::Semaphore,
-    render_finished_semaphore: vk::Semaphore,
     command_buffer: vk::CommandBuffer,
     command_pool: vk::CommandPool,
 }
@@ -41,8 +44,13 @@ struct GPUMeshBuffers {
 
 #[repr(C, align(16))]
 struct GPUDrawPushConstants {
-    world_matrix: glam::Mat4,
     vertex_buffer: vk::DeviceAddress,
+}
+
+struct UniformBufferObject {
+    model: glam::Mat4,
+    view: glam::Mat4,
+    proj: glam::Mat4,
 }
 
 pub struct Renderer {
@@ -54,8 +62,7 @@ pub struct Renderer {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     global_descriptor_allocator: DescriptorAllocator,
-    draw_image_descriptors: vk::DescriptorSet,
-    draw_image_descriptor_layout: vk::DescriptorSetLayout,
+    render_finished_semaphores: Vec<vk::Semaphore>,
     frame_number: usize,
     frames: Vec<Frame>,
     swapchain: Swapchain,
@@ -68,16 +75,37 @@ impl Renderer {
     pub fn new(context: Arc<RenderingContext>, window: Arc<Window>) -> Result<Self> {
         let mut swapchain = Swapchain::new(context.clone(), window.clone())?;
         swapchain.resize()?;
+
+        let mut allocator = Allocator::new(&AllocatorCreateDesc {
+            instance: context.instance.clone(),
+            device: context.device.clone(),
+            physical_device: context.physical_device.handle,
+            debug_settings: Default::default(),
+            buffer_device_address: true,
+            allocation_sizes: Default::default(),
+        })?;
+
+        let sizes = Vec::from([PoolSizeRatio {
+            desc_type: vk::DescriptorType::UNIFORM_BUFFER,
+            ratio: 1,
+        }]);
+        let global_descriptor_allocator = DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32, sizes)?;
+
         unsafe {
+            let mut render_finished_semaphores: Vec<vk::Semaphore> = Vec::with_capacity(swapchain.images.len() as usize);
+            for i in 0..swapchain.images.len() {
+                let render_finished_semaphore = context
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                render_finished_semaphores.push(render_finished_semaphore);
+            }
+
             let mut frames: Vec<Frame> = Vec::with_capacity(FRAME_OVERLAP);
             for i in 0..FRAME_OVERLAP {
                 let image_available_semaphore = context
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-                let render_finished_semaphore = context
-                    .device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-                let in_flight_fence = context.device.create_fence(
+               let in_flight_fence = context.device.create_fence(
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                     None,
                 )?;
@@ -100,50 +128,55 @@ impl Renderer {
                     .next()
                     .unwrap();
 
+                let uniform_buffer = context.create_buffer(
+                    &mut allocator,
+                    std::mem::size_of::<UniformBufferObject>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    gpu_allocator::MemoryLocation::CpuToGpu,
+                )?;
+                let mut descriptor_layout_builder = DescriptorLayoutBuilder::new();
+                descriptor_layout_builder.add_binding(0, vk::DescriptorType::UNIFORM_BUFFER);
+
+                let uniform_buffer_descriptor_layout = descriptor_layout_builder
+                    .build(&context.device, vk::ShaderStageFlags::VERTEX)?;
+
+                let uniform_buffer_descriptors = global_descriptor_allocator
+                    .allocate(&context.device, uniform_buffer_descriptor_layout)?;
+
+                context.device.update_descriptor_sets(
+                    &[vk::WriteDescriptorSet::default()
+                        .dst_binding(0)
+                        .dst_set(uniform_buffer_descriptors)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(&[vk::DescriptorBufferInfo::default()
+                            .buffer(uniform_buffer.buffer)
+                            .range(std::mem::size_of::<UniformBufferObject>() as u64)])],
+                    &[],
+                );
+
                 frames.push(Frame {
+                    uniform_buffer_descriptors,
+                    uniform_buffer_descriptor_layout,
+                    uniform_buffer,
                     image_available_semaphore,
-                    render_finished_semaphore,
                     in_flight_fence,
                     command_buffer,
                     command_pool,
                 });
             }
 
-            let sizes = Vec::from([PoolSizeRatio {
-                desc_type: vk::DescriptorType::STORAGE_IMAGE,
-                ratio: 1,
-            }]);
-
-            let global_descriptor_allocator = DescriptorAllocator::new(&context.device, 10, sizes)?;
-            let mut descriptor_layout_builder = DescriptorLayoutBuilder::new();
-            descriptor_layout_builder.add_binding(0, vk::DescriptorType::STORAGE_IMAGE);
-
-            let draw_image_descriptor_layout =
-                descriptor_layout_builder.build(&context.device, vk::ShaderStageFlags::COMPUTE)?;
-
-            let draw_image_descriptors = global_descriptor_allocator
-                .allocate(&context.device, draw_image_descriptor_layout)?;
-
-            /*
-            context.device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_binding(0)
-                    .dst_set(draw_image_descriptors)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .descriptor_count(1)
-                    .image_info(&[vk::DescriptorImageInfo::default()
-                        .image_layout(vk::ImageLayout::GENERAL)
-                        .image_view(swapchain.draw_image.image_view)])],
-                &[],
-            );*/
-
+            let descriptor_set_layouts = frames
+                .iter()
+                .map(|frame| return frame.uniform_buffer_descriptor_layout)
+                .collect::<Vec<_>>();
             let pipeline_layout = context.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&[
-                    vk::PushConstantRange::default()
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&descriptor_set_layouts)
+                    .push_constant_ranges(&[vk::PushConstantRange::default()
                         .offset(0)
                         .size(std::mem::size_of::<GPUDrawPushConstants>() as u32)
-                        .stage_flags(vk::ShaderStageFlags::VERTEX),
-                ]),
+                        .stage_flags(vk::ShaderStageFlags::VERTEX)]),
                 None,
             )?;
 
@@ -194,15 +227,6 @@ impl Renderer {
             ];
             let indices: &[u32] = &[0, 1, 2, 2, 3, 0];
 
-            let mut allocator = Allocator::new(&AllocatorCreateDesc {
-                instance: context.instance.clone(),
-                device: context.device.clone(),
-                physical_device: context.physical_device.handle,
-                debug_settings: Default::default(),
-                buffer_device_address: true,
-                allocation_sizes: Default::default(),
-            })?;
-
             let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as u64;
 
             let vertex_buffer = context.create_buffer(
@@ -230,8 +254,8 @@ impl Renderer {
             )?;
 
             let data = staging.allocation.mapped_ptr().unwrap().as_ptr();
-            std::ptr::copy(vertices.as_ptr(), data.cast(), vertices.len());
-            std::ptr::copy(
+            std::ptr::copy_nonoverlapping(vertices.as_ptr(), data.cast(), vertices.len());
+            std::ptr::copy_nonoverlapping(
                 indices.as_ptr(),
                 data.cast::<u32>().byte_add(vertex_buffer_size as usize),
                 indices.len(),
@@ -306,8 +330,7 @@ impl Renderer {
                 pipeline,
                 pipeline_layout,
                 global_descriptor_allocator,
-                draw_image_descriptor_layout,
-                draw_image_descriptors,
+                render_finished_semaphores,
                 frame_number: 0,
                 frames,
                 swapchain,
@@ -378,6 +401,41 @@ impl Renderer {
         unsafe {
             let frame = &mut self.frames[self.frame_number % FRAME_OVERLAP];
 
+            let ubo = UniformBufferObject {
+                model: glam::Mat4::from_rotation_x(45.0 + (self.frame_number as f32) * 0.01),
+                view: glam::Mat4::look_at_lh(
+                    glam::Vec3 {
+                        x: 2.0,
+                        y: 2.0,
+                        z: 2.0,
+                    },
+                    glam::Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    glam::Vec3 {
+                        x: 0.0,
+                        y: 1.0,
+                        z: 0.0,
+                    },
+                ),
+                proj: glam::Mat4::perspective_lh(
+                    45.0,
+                    self.swapchain.draw_image.extent.width as f32
+                        / self.swapchain.draw_image.extent.height as f32,
+                    0.0,
+                    1000.0,
+                ),
+            };
+            let ubo_ptr = frame
+                .uniform_buffer
+                .allocation
+                .mapped_ptr()
+                .unwrap()
+                .as_ptr();
+            std::ptr::copy_nonoverlapping(&ubo, ubo_ptr.cast(), 1);
+
             // Wait until gpu finished rendering last frame
             self.context
                 .device
@@ -385,6 +443,7 @@ impl Renderer {
 
             if self.swapchain.is_dirty {
                 self.swapchain.resize()?;
+                self.swapchain.is_dirty = false;
             }
 
             let image_index_result = self
@@ -427,7 +486,7 @@ impl Renderer {
                 frame.command_buffer,
                 self.swapchain.draw_image.image_view,
                 vk::ClearColorValue {
-                    float32: [1.0, 0.0, 0.0, 1.0],
+                    float32: [0.0, 0.0, 0.0, 1.0],
                 },
                 vk::Rect2D::default().extent(extent),
             );
@@ -454,7 +513,6 @@ impl Renderer {
 
             let push_constants = GPUDrawPushConstants {
                 vertex_buffer: self.gpu_mesh_buffers.vertex_buffer_address,
-                world_matrix: Mat4::identity(),
             };
             self.context.device.cmd_push_constants(
                 frame.command_buffer,
@@ -471,6 +529,15 @@ impl Renderer {
                 self.gpu_mesh_buffers.index_buffer.buffer,
                 0,
                 vk::IndexType::UINT32,
+            );
+
+            self.context.device.cmd_bind_descriptor_sets(
+                frame.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[frame.uniform_buffer_descriptors],
+                &[],
             );
 
             self.context
@@ -518,6 +585,8 @@ impl Renderer {
                 .device
                 .end_command_buffer(frame.command_buffer)?;
 
+            let render_finished_semaphore = self.render_finished_semaphores[image_index as usize];
+
             self.context.device.queue_submit2(
                 self.context.queues[self.context.queue_families.graphics as usize],
                 &[vk::SubmitInfo2::default()
@@ -525,7 +594,7 @@ impl Renderer {
                         .semaphore(frame.image_available_semaphore)
                         .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT_KHR)])
                     .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                        .semaphore(frame.render_finished_semaphore)
+                        .semaphore(render_finished_semaphore)
                         .stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS)])
                     .command_buffer_infos(&[
                         vk::CommandBufferSubmitInfo::default().command_buffer(frame.command_buffer)
@@ -534,7 +603,7 @@ impl Renderer {
             )?;
 
             self.swapchain
-                .present(image_index, frame.render_finished_semaphore)?;
+                .present(image_index, render_finished_semaphore)?;
 
             self.frame_number += 1;
 
@@ -551,14 +620,17 @@ impl Drop for Renderer {
         unsafe {
             self.context.device.device_wait_idle().unwrap();
 
-            self.frames.drain(..).for_each(|frame| {
+            self.render_finished_semaphores.drain(..).for_each(|semaphore| {
+                self.context
+                    .device
+                    .destroy_semaphore(semaphore, None);
+            });
+
+            self.frames.drain(..).for_each(|mut frame| {
                 self.context
                     .device
                     .destroy_semaphore(frame.image_available_semaphore, None);
-                self.context
-                    .device
-                    .destroy_semaphore(frame.render_finished_semaphore, None);
-                self.context
+               self.context
                     .device
                     .destroy_fence(frame.in_flight_fence, None);
                 self.context
@@ -567,13 +639,15 @@ impl Drop for Renderer {
                 self.context
                     .device
                     .destroy_command_pool(frame.command_pool, None);
+                self.context
+                    .destroy_buffer(&mut self.allocator, &mut frame.uniform_buffer);
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(frame.uniform_buffer_descriptor_layout, None);
             });
 
             self.global_descriptor_allocator
                 .destroy_pool(&self.context.device);
-            self.context
-                .device
-                .destroy_descriptor_set_layout(self.draw_image_descriptor_layout, None);
 
             self.context
                 .device
