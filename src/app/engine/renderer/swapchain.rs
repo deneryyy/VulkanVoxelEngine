@@ -188,70 +188,13 @@ impl Swapchain {
             depth: 1,
         };
 
-        let draw_image_handle = unsafe {
-            context.device.create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::D32_SFLOAT)
-                    .extent(draw_image_extent)
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )?
-        };
-
-        let requirements = unsafe {
-            context
-                .device
-                .get_image_memory_requirements(draw_image_handle)
-        };
-
-        let allocation = allocator.allocate(&AllocationCreateDesc {
-            name: "Depth Image",
-            requirements,
-            location: MemoryLocation::GpuOnly,
-            linear: false,
-            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-        })?;
-
-        unsafe {
-            context.device.bind_image_memory(
-                draw_image_handle,
-                allocation.memory(),
-                allocation.offset(),
-            )?
-        };
-
-        let image_view = unsafe {
-            context.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .image(draw_image_handle)
-                    .format(vk::Format::D32_SFLOAT)
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                            .base_mip_level(0)
-                            .layer_count(1)
-                            .base_array_layer(0)
-                            .level_count(1),
-                    ),
-                None,
-            )?
-        };
-
-        Ok(AllocatedImage {
-            image: draw_image_handle,
-            image_view,
-            allocation: allocation,
-            image_format: vk::Format::D32_SFLOAT,
-            extent: draw_image_extent,
-        })
+        context.create_image(
+            allocator,
+            draw_image_extent,
+            vk::Format::D32_SFLOAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageAspectFlags::DEPTH,
+        )
     }
 
     fn create_draw_image(
@@ -265,75 +208,16 @@ impl Swapchain {
             depth: 1,
         };
 
-        let draw_image_handle = unsafe {
-            context.device.create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::R16G16B16A16_SFLOAT)
-                    .extent(draw_image_extent)
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(
-                        vk::ImageUsageFlags::TRANSFER_SRC
-                            | vk::ImageUsageFlags::TRANSFER_DST
-                            | vk::ImageUsageFlags::STORAGE
-                            | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                    )
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )?
-        };
-
-        let requirements = unsafe {
-            context
-                .device
-                .get_image_memory_requirements(draw_image_handle)
-        };
-
-        let allocation = allocator.allocate(&AllocationCreateDesc {
-            name: "Draw Image",
-            requirements,
-            location: MemoryLocation::GpuOnly,
-            linear: false,
-            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-        })?;
-
-        unsafe {
-            context.device.bind_image_memory(
-                draw_image_handle,
-                allocation.memory(),
-                allocation.offset(),
-            )?
-        };
-
-        let image_view = unsafe {
-            context.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .image(draw_image_handle)
-                    .format(vk::Format::R16G16B16A16_SFLOAT)
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .layer_count(1)
-                            .base_array_layer(0)
-                            .level_count(1),
-                    ),
-                None,
-            )?
-        };
-
-        Ok(AllocatedImage {
-            image: draw_image_handle,
-            image_view,
-            allocation: allocation,
-            image_format: vk::Format::R16G16B16A16_SFLOAT,
-            extent: draw_image_extent,
-        })
+        context.create_image(
+            allocator,
+            draw_image_extent,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::ImageAspectFlags::COLOR,
+        )
     }
 
     pub fn acquire_next_image(&mut self, image_available_semaphore: vk::Semaphore) -> Result<u32> {

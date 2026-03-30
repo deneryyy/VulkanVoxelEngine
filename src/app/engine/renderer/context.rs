@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Ok, Result};
 use ash::vk::{
-    self, BufferCreateInfo, ImageSubresourceLayers, ImageSubresourceRange,
+    self, BufferCreateInfo, CommandBufferUsageFlags, ImageSubresourceLayers, ImageSubresourceRange,
     PipelineDepthStencilStateCreateInfo, RenderingAttachmentInfo,
 };
 use gpu_allocator::{
@@ -58,6 +58,9 @@ pub struct AllocatedBuffer {
 }
 
 pub struct RenderingContext {
+    imm_fence: vk::Fence,
+    imm_command_buffer: vk::CommandBuffer,
+    imm_command_pool: vk::CommandPool,
     pub queues: Vec<vk::Queue>,
     pub swapchain_extension: ash::khr::swapchain::Device,
     pub device: ash::Device,
@@ -133,7 +136,9 @@ impl RenderingContext {
                 .into_iter()
                 .map(|handle| {
                     let properties = instance.get_physical_device_properties(handle);
-                    let features = instance.get_physical_device_features(handle);
+                    let features = instance
+                        .get_physical_device_features(handle)
+                        .sampler_anisotropy(true);
                     let memory_properties = instance.get_physical_device_memory_properties(handle);
                     let queue_family_properties =
                         instance.get_physical_device_queue_family_properties(handle);
@@ -187,6 +192,7 @@ impl RenderingContext {
             let device = instance.create_device(
                 physical_device.handle,
                 &vk::DeviceCreateInfo::default()
+                    .enabled_features(&physical_device.features)
                     .queue_create_infos(&queue_create_infos)
                     .enabled_extension_names(&[ash::khr::swapchain::NAME.as_ptr()])
                     .push_next(
@@ -209,7 +215,33 @@ impl RenderingContext {
                 .map(|index| device.get_device_queue(*index, 0))
                 .collect::<Vec<_>>();
 
+            let imm_command_pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_families.graphics)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )?;
+
+            let &imm_command_buffer = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(imm_command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )?
+                .iter()
+                .next()
+                .unwrap();
+
+            let imm_fence = device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )?;
+
             Ok(Self {
+                imm_fence,
+                imm_command_buffer,
+                imm_command_pool,
                 queues,
                 swapchain_extension,
                 device,
@@ -253,6 +285,57 @@ impl RenderingContext {
                 present_modes,
             })
         }
+    }
+
+    pub fn create_image(
+        &self,
+        allocator: &mut Allocator,
+        extent: vk::Extent3D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        aspect_flags: vk::ImageAspectFlags,
+    ) -> Result<AllocatedImage> {
+        let image_handle = unsafe {
+            self.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(extent)
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?
+        };
+
+        let requirements = unsafe { self.device.get_image_memory_requirements(image_handle) };
+
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name: "Image",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+
+        unsafe {
+            self.device
+                .bind_image_memory(image_handle, allocation.memory(), allocation.offset())?
+        };
+
+        let image_view = self.create_image_view(image_handle, format, aspect_flags)?;
+
+        Ok(AllocatedImage {
+            image: image_handle,
+            image_view,
+            allocation: allocation,
+            image_format: format,
+            extent,
+        })
     }
 
     pub fn create_image_view(
@@ -370,6 +453,41 @@ impl RenderingContext {
         }
     }
 
+    pub fn begin_immediate_submit(&self) -> Result<vk::CommandBuffer> {
+        unsafe {
+            self.device.reset_fences(&[self.imm_fence])?;
+            self.device.reset_command_buffer(
+                self.imm_command_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )?;
+            self.device.begin_command_buffer(
+                self.imm_command_buffer,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+
+            Ok(self.imm_command_buffer)
+        }
+    }
+
+    pub fn end_immediate_submit(&self) -> Result<()> {
+        unsafe {
+            self.device.end_command_buffer(self.imm_command_buffer)?;
+
+            self.device.queue_submit2(
+                self.queues[self.queue_families.graphics as usize],
+                &[vk::SubmitInfo2::default()
+                    .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default()
+                        .command_buffer(self.imm_command_buffer)])],
+                self.imm_fence,
+            )?;
+
+            self.device
+                .wait_for_fences(&[self.imm_fence], true, u64::MAX)?;
+            Ok(())
+        }
+    }
+
     pub fn create_graphics_pipeline(
         &self,
         swapchain_extent: vk::Extent2D,
@@ -444,7 +562,7 @@ impl RenderingContext {
                                 .depth_bounds_test_enable(false)
                                 .stencil_test_enable(false)
                                 .min_depth_bounds(0.0)
-                                .max_depth_bounds(1.0)
+                                .max_depth_bounds(1.0),
                         )
                         .push_next(
                             &mut vk::PipelineRenderingCreateInfo::default()
@@ -535,6 +653,9 @@ impl RenderingContext {
 impl Drop for RenderingContext {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_fence(self.imm_fence, None);
+            self.device
+                .destroy_command_pool(self.imm_command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }

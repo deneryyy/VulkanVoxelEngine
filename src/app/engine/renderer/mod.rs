@@ -3,9 +3,10 @@ pub mod context;
 pub mod descriptor;
 pub mod model;
 pub mod swapchain;
+pub mod texture;
 pub mod vertex;
 
-use std::{sync::Arc, u32};
+use std::{io::Cursor, sync::Arc, u32};
 
 use anyhow::{Ok, Result};
 use glam::{Mat4, Vec3, Vec3Swizzles};
@@ -13,6 +14,7 @@ use gpu_allocator::{
     AllocatorDebugSettings,
     vulkan::{Allocator, AllocatorCreateDesc},
 };
+use image::{ImageReader, Rgba};
 use std::result::Result::Ok as stdOk;
 use winit::{
     event::{ElementState, KeyEvent},
@@ -26,6 +28,7 @@ use crate::app::engine::{
         context::{AllocatedBuffer, AllocatedImage, RenderingContext},
         descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
         swapchain::Swapchain,
+        texture::Texture,
         vertex::Vertex,
     },
     resources,
@@ -62,10 +65,8 @@ struct UniformBufferObject {
 pub struct Renderer {
     allocator: Allocator,
     camera: Camera,
+    texture: Texture,
     gpu_mesh_buffers: GPUMeshBuffers,
-    imm_fence: vk::Fence,
-    imm_command_buffer: vk::CommandBuffer,
-    imm_command_pool: vk::CommandPool,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     global_descriptor_allocator: DescriptorAllocator,
@@ -92,10 +93,19 @@ impl Renderer {
             allocation_sizes: Default::default(),
         })?;
 
-        let sizes = Vec::from([PoolSizeRatio {
-            desc_type: vk::DescriptorType::UNIFORM_BUFFER,
-            ratio: 1,
-        }]);
+        let texture =
+            Texture::load_texture("textures/texture.jpg", context.clone(), &mut allocator)?;
+
+        let sizes = Vec::from([
+            PoolSizeRatio {
+                desc_type: vk::DescriptorType::UNIFORM_BUFFER,
+                ratio: 1,
+            },
+            PoolSizeRatio {
+                desc_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                ratio: 1,
+            },
+        ]);
         let global_descriptor_allocator =
             DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32, sizes)?;
 
@@ -144,23 +154,43 @@ impl Renderer {
                     gpu_allocator::MemoryLocation::CpuToGpu,
                 )?;
                 let mut descriptor_layout_builder = DescriptorLayoutBuilder::new();
-                descriptor_layout_builder.add_binding(0, vk::DescriptorType::UNIFORM_BUFFER);
+                descriptor_layout_builder.add_binding(
+                    0,
+                    vk::DescriptorType::UNIFORM_BUFFER,
+                    vk::ShaderStageFlags::VERTEX,
+                );
+                descriptor_layout_builder.add_binding(
+                    1,
+                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    vk::ShaderStageFlags::FRAGMENT,
+                );
 
-                let uniform_buffer_descriptor_layout = descriptor_layout_builder
-                    .build(&context.device, vk::ShaderStageFlags::VERTEX)?;
+                let uniform_buffer_descriptor_layout =
+                    descriptor_layout_builder.build(&context.device)?;
 
                 let uniform_buffer_descriptors = global_descriptor_allocator
                     .allocate(&context.device, uniform_buffer_descriptor_layout)?;
 
                 context.device.update_descriptor_sets(
-                    &[vk::WriteDescriptorSet::default()
-                        .dst_binding(0)
-                        .dst_set(uniform_buffer_descriptors)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .descriptor_count(1)
-                        .buffer_info(&[vk::DescriptorBufferInfo::default()
-                            .buffer(uniform_buffer.buffer)
-                            .range(std::mem::size_of::<UniformBufferObject>() as u64)])],
+                    &[
+                        vk::WriteDescriptorSet::default()
+                            .dst_binding(0)
+                            .dst_set(uniform_buffer_descriptors)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .buffer_info(&[vk::DescriptorBufferInfo::default()
+                                .buffer(uniform_buffer.buffer)
+                                .range(std::mem::size_of::<UniformBufferObject>() as u64)]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_binding(1)
+                            .dst_set(uniform_buffer_descriptors)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1)
+                            .image_info(&[vk::DescriptorImageInfo::default()
+                                .image_view(texture.image.image_view)
+                                .sampler(texture.sampler)
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
+                    ],
                     &[],
                 );
 
@@ -189,8 +219,10 @@ impl Renderer {
                 None,
             )?;
 
-            let vertex_shader = Self::load_shader_module("shader.vert.spv", &context.device)?;
-            let fragment_shader = Self::load_shader_module("shader.frag.spv", &context.device)?;
+            let vertex_shader =
+                Self::load_shader_module("shaders/shader.vert.spv", &context.device)?;
+            let fragment_shader =
+                Self::load_shader_module("shaders/shader.frag.spv", &context.device)?;
             let pipeline = context.create_graphics_pipeline(
                 vk::Extent2D::default()
                     .width(swapchain.draw_image.extent.width)
@@ -205,39 +237,39 @@ impl Renderer {
             context.device.destroy_shader_module(vertex_shader, None);
             context.device.destroy_shader_module(fragment_shader, None);
 
-            let imm_command_pool = context.device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(context.queue_families.graphics)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )?;
-
-            let &imm_command_buffer = context
-                .device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(imm_command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )?
-                .iter()
-                .next()
-                .unwrap();
-
-            let imm_fence = context.device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )?;
-
             let vertices = &[
-                Vertex::new([-0.5, -0.5, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]),
-                Vertex::new([0.5, -0.5, 0.0], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5]),
-                Vertex::new([0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]),
-                Vertex::new([-0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
-                Vertex::new([-0.5, -0.5, 0.5], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]),
-                Vertex::new([0.5, -0.5, 0.5], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5]),
-                Vertex::new([0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]),
-                Vertex::new([-0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+                Vertex::new(
+                    [-0.5, -0.5, -0.5],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 1.0, 1.0],
+                    1.0,
+                    0.0,
+                ),
+                Vertex::new(
+                    [0.5, -0.5, -0.5],
+                    [0.0, 0.0, 0.0],
+                    [0.5, 0.5, 0.5],
+                    0.0,
+                    0.0,
+                ),
+                Vertex::new([0.5, 0.5, -0.5], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0], 0.0, 1.0),
+                Vertex::new(
+                    [-0.5, 0.5, -0.5],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    1.0,
+                    1.0,
+                ),
+                Vertex::new(
+                    [-0.5, -0.5, 0.5],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 1.0, 1.0],
+                    1.0,
+                    0.0,
+                ),
+                Vertex::new([0.5, -0.5, 0.5], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5], 0.0, 0.0),
+                Vertex::new([0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0], 0.0, 1.0),
+                Vertex::new([-0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 1.0, 1.0),
             ];
             let indices: &[u32] = &[0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4];
 
@@ -275,7 +307,7 @@ impl Renderer {
                 indices.len(),
             );
 
-            let cmd = Self::begin_immediate_submit(context.clone(), imm_fence, imm_command_buffer)?;
+            let cmd = context.begin_immediate_submit()?;
 
             context.device.cmd_copy_buffer(
                 cmd,
@@ -324,7 +356,7 @@ impl Renderer {
                 ]),
             );
 
-            Self::end_immediate_submit(context.clone(), imm_fence, imm_command_buffer)?;
+            context.end_immediate_submit()?;
             let vertex_buffer_address = context.device.get_buffer_device_address(
                 &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
             );
@@ -354,10 +386,8 @@ impl Renderer {
             Ok(Self {
                 allocator,
                 camera,
+                texture,
                 gpu_mesh_buffers,
-                imm_fence,
-                imm_command_buffer,
-                imm_command_pool,
                 pipeline,
                 pipeline_layout,
                 global_descriptor_allocator,
@@ -385,49 +415,6 @@ impl Renderer {
         }
     }
 
-    fn begin_immediate_submit(
-        context: Arc<RenderingContext>,
-        imm_fence: vk::Fence,
-        imm_command_buffer: vk::CommandBuffer,
-    ) -> Result<vk::CommandBuffer> {
-        unsafe {
-            context.device.reset_fences(&[imm_fence])?;
-            context
-                .device
-                .reset_command_buffer(imm_command_buffer, vk::CommandBufferResetFlags::empty())?;
-            context.device.begin_command_buffer(
-                imm_command_buffer,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-
-            Ok(imm_command_buffer)
-        }
-    }
-
-    fn end_immediate_submit(
-        context: Arc<RenderingContext>,
-        imm_fence: vk::Fence,
-        imm_command_buffer: vk::CommandBuffer,
-    ) -> Result<()> {
-        unsafe {
-            context.device.end_command_buffer(imm_command_buffer)?;
-
-            context.device.queue_submit2(
-                context.queues[context.queue_families.graphics as usize],
-                &[vk::SubmitInfo2::default().command_buffer_infos(&[
-                    vk::CommandBufferSubmitInfo::default().command_buffer(imm_command_buffer),
-                ])],
-                imm_fence,
-            )?;
-
-            context
-                .device
-                .wait_for_fences(&[imm_fence], true, u64::MAX)?;
-            Ok(())
-        }
-    }
-
     pub fn render(&mut self) -> Result<()> {
         unsafe {
             let frame = &mut self.frames[self.frame_number % FRAME_OVERLAP];
@@ -436,7 +423,7 @@ impl Renderer {
                 self.swapchain.draw_image.extent.width as f32
                     / self.swapchain.draw_image.extent.height as f32,
                 0.1,
-                10.0,
+                1000.0,
             );
             proj.y_axis.y *= -1.0;
 
@@ -687,23 +674,14 @@ impl Drop for Renderer {
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.context.device.destroy_pipeline(self.pipeline, None);
 
-            self.context.device.destroy_fence(self.imm_fence, None);
-            self.context
-                .device
-                .destroy_command_pool(self.imm_command_pool, None);
-
             self.context.destroy_buffer(
                 &mut self.allocator,
                 &mut self.gpu_mesh_buffers.vertex_buffer,
             );
             self.context
                 .destroy_buffer(&mut self.allocator, &mut self.gpu_mesh_buffers.index_buffer);
-            /*
-            self.context.device.destroy_pipeline(self.pipeline, None);
-            self.context
-                .device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            */
+
+            Texture::destroy_texture(self.context.clone(), &mut self.allocator, &mut self.texture);
         }
     }
 }

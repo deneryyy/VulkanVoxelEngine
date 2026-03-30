@@ -12,12 +12,13 @@ impl<'a> DescriptorLayoutBuilder<'a> {
         }
     }
 
-    pub fn add_binding(&mut self, binding: u32, desc_type: vk::DescriptorType) {
+    pub fn add_binding(&mut self, binding: u32, desc_type: vk::DescriptorType, shader_stages: vk::ShaderStageFlags) {
         self.bindings.push(
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
                 .descriptor_count(1)
-                .descriptor_type(desc_type),
+                .descriptor_type(desc_type)
+                .stage_flags(shader_stages),
         );
     }
 
@@ -28,12 +29,7 @@ impl<'a> DescriptorLayoutBuilder<'a> {
     pub fn build(
         &mut self,
         device: &ash::Device,
-        shader_stages: vk::ShaderStageFlags,
     ) -> Result<vk::DescriptorSetLayout> {
-        for b in &mut self.bindings {
-            b.stage_flags |= shader_stages
-        }
-
         unsafe {
             Ok(device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default()
