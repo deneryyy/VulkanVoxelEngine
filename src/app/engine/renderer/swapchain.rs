@@ -13,6 +13,7 @@ use std::result::Result::Ok as stdOk;
 
 pub struct Swapchain {
     allocator: Allocator,
+    pub depth_image: AllocatedImage,
     pub draw_image: AllocatedImage,
     pub desired_image_count: u32,
     pub format: vk::Format,
@@ -58,9 +59,12 @@ impl Swapchain {
         })?;
 
         let draw_image = Self::create_draw_image(window.clone(), context.clone(), &mut allocator)?;
+        let depth_image =
+            Self::create_depth_image(window.clone(), context.clone(), &mut allocator)?;
 
         Ok(Self {
             allocator,
+            depth_image,
             draw_image,
             desired_image_count,
             format,
@@ -134,6 +138,16 @@ impl Swapchain {
             self.allocator
                 .free(std::mem::take(&mut self.draw_image.allocation))
                 .unwrap();
+            // Destroying depth image
+            self.context
+                .device
+                .destroy_image(self.depth_image.image, None);
+            self.context
+                .device
+                .destroy_image_view(self.depth_image.image_view, None);
+            self.allocator
+                .free(std::mem::take(&mut self.depth_image.allocation))
+                .unwrap();
             // getting new ones
             self.handle = new_swapchain;
             self.images = self
@@ -153,9 +167,91 @@ impl Swapchain {
                 self.context.clone(),
                 &mut self.allocator,
             )?;
+            self.depth_image = Self::create_depth_image(
+                self.window.clone(),
+                self.context.clone(),
+                &mut self.allocator,
+            )?;
         }
 
         Ok(())
+    }
+
+    fn create_depth_image(
+        window: Arc<Window>,
+        context: Arc<RenderingContext>,
+        allocator: &mut Allocator,
+    ) -> Result<AllocatedImage> {
+        let draw_image_extent = vk::Extent3D {
+            width: window.inner_size().width,
+            height: window.inner_size().height,
+            depth: 1,
+        };
+
+        let draw_image_handle = unsafe {
+            context.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .extent(draw_image_extent)
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?
+        };
+
+        let requirements = unsafe {
+            context
+                .device
+                .get_image_memory_requirements(draw_image_handle)
+        };
+
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name: "Depth Image",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+
+        unsafe {
+            context.device.bind_image_memory(
+                draw_image_handle,
+                allocation.memory(),
+                allocation.offset(),
+            )?
+        };
+
+        let image_view = unsafe {
+            context.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .image(draw_image_handle)
+                    .format(vk::Format::D32_SFLOAT)
+                    .subresource_range(
+                        ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .base_mip_level(0)
+                            .layer_count(1)
+                            .base_array_layer(0)
+                            .level_count(1),
+                    ),
+                None,
+            )?
+        };
+
+        Ok(AllocatedImage {
+            image: draw_image_handle,
+            image_view,
+            allocation: allocation,
+            image_format: vk::Format::D32_SFLOAT,
+            extent: draw_image_extent,
+        })
     }
 
     fn create_draw_image(
@@ -209,7 +305,7 @@ impl Swapchain {
             context.device.bind_image_memory(
                 draw_image_handle,
                 allocation.memory(),
-                vk::DeviceSize::default(),
+                allocation.offset(),
             )?
         };
 
@@ -294,6 +390,15 @@ impl Drop for Swapchain {
             self.context
                 .surface_extension
                 .destroy_surface(self.surface.handle, None);
+            self.context
+                .device
+                .destroy_image(self.depth_image.image, None);
+            self.context
+                .device
+                .destroy_image_view(self.depth_image.image_view, None);
+            self.allocator
+                .free(std::mem::take(&mut self.depth_image.allocation))
+                .unwrap();
             self.context
                 .device
                 .destroy_image(self.draw_image.image, None);

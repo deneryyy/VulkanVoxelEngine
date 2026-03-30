@@ -14,7 +14,11 @@ use gpu_allocator::{
     vulkan::{Allocator, AllocatorCreateDesc},
 };
 use std::result::Result::Ok as stdOk;
-use winit::{event::{ElementState, KeyEvent}, keyboard::KeyCode, window::Window};
+use winit::{
+    event::{ElementState, KeyEvent},
+    keyboard::KeyCode,
+    window::Window,
+};
 
 use crate::app::engine::{
     renderer::{
@@ -192,6 +196,7 @@ impl Renderer {
                     .width(swapchain.draw_image.extent.width)
                     .height(swapchain.draw_image.extent.height),
                 swapchain.draw_image.image_format,
+                swapchain.depth_image.image_format,
                 vertex_shader,
                 fragment_shader,
                 pipeline_layout,
@@ -229,8 +234,12 @@ impl Renderer {
                 Vertex::new([0.5, -0.5, 0.0], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5]),
                 Vertex::new([0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]),
                 Vertex::new([-0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+                Vertex::new([-0.5, -0.5, 0.5], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]),
+                Vertex::new([0.5, -0.5, 0.5], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5]),
+                Vertex::new([0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]),
+                Vertex::new([-0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
             ];
-            let indices: &[u32] = &[0, 1, 2, 2, 3, 0];
+            let indices: &[u32] = &[0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4];
 
             let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as u64;
 
@@ -422,13 +431,13 @@ impl Renderer {
     pub fn render(&mut self) -> Result<()> {
         unsafe {
             let frame = &mut self.frames[self.frame_number % FRAME_OVERLAP];
-            let mut proj =  glam::Mat4::perspective_rh(
-                    45.0,
-                    self.swapchain.draw_image.extent.width as f32
-                        / self.swapchain.draw_image.extent.height as f32,
-                    0.0,
-                    1000.0,
-                );
+            let mut proj = glam::Mat4::perspective_rh(
+                45.0,
+                self.swapchain.draw_image.extent.width as f32
+                    / self.swapchain.draw_image.extent.height as f32,
+                0.1,
+                10.0,
+            );
             proj.y_axis.y *= -1.0;
 
             let ubo = UniformBufferObject {
@@ -486,6 +495,14 @@ impl Renderer {
                 vk::ImageAspectFlags::COLOR,
             );
 
+            self.context.transition_image_layout(
+                frame.command_buffer,
+                self.swapchain.depth_image.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::ImageAspectFlags::DEPTH,
+            );
+
             let extent = vk::Extent2D::default()
                 .width(self.swapchain.draw_image.extent.width)
                 .height(self.swapchain.draw_image.extent.height);
@@ -493,6 +510,7 @@ impl Renderer {
             self.context.begin_rendering(
                 frame.command_buffer,
                 self.swapchain.draw_image.image_view,
+                self.swapchain.depth_image.image_view,
                 vk::ClearColorValue {
                     float32: [0.0, 0.0, 0.0, 1.0],
                 },
@@ -504,7 +522,9 @@ impl Renderer {
                 0,
                 &[vk::Viewport::default()
                     .width(extent.width as f32)
-                    .height(extent.height as f32)],
+                    .height(extent.height as f32)
+                    .min_depth(0.0)
+                    .max_depth(1.0)],
             );
 
             self.context.device.cmd_set_scissor(
@@ -550,7 +570,7 @@ impl Renderer {
 
             self.context
                 .device
-                .cmd_draw_indexed(frame.command_buffer, 6, 1, 0, 0, 0);
+                .cmd_draw_indexed(frame.command_buffer, 12, 1, 0, 0, 0);
 
             self.context.device.cmd_end_rendering(frame.command_buffer);
 

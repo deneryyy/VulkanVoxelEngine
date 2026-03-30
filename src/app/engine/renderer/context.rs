@@ -2,7 +2,10 @@ use core::ffi;
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Ok, Result};
-use ash::vk::{self, BufferCreateInfo, ImageSubresourceLayers, ImageSubresourceRange};
+use ash::vk::{
+    self, BufferCreateInfo, ImageSubresourceLayers, ImageSubresourceRange,
+    PipelineDepthStencilStateCreateInfo, RenderingAttachmentInfo,
+};
 use gpu_allocator::{
     MemoryLocation,
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
@@ -371,6 +374,7 @@ impl RenderingContext {
         &self,
         swapchain_extent: vk::Extent2D,
         swapchain_format: vk::Format,
+        depth_format: vk::Format,
         vertex_shader: vk::ShaderModule,
         fragment_shader: vk::ShaderModule,
         pipeline_layout: vk::PipelineLayout,
@@ -432,9 +436,20 @@ impl RenderingContext {
                             ]),
                         )
                         .layout(pipeline_layout)
+                        .depth_stencil_state(
+                            &PipelineDepthStencilStateCreateInfo::default()
+                                .depth_test_enable(true)
+                                .depth_write_enable(true)
+                                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+                                .depth_bounds_test_enable(false)
+                                .stencil_test_enable(false)
+                                .min_depth_bounds(0.0)
+                                .max_depth_bounds(1.0)
+                        )
                         .push_next(
                             &mut vk::PipelineRenderingCreateInfo::default()
-                                .color_attachment_formats(&[swapchain_format]),
+                                .color_attachment_formats(&[swapchain_format])
+                                .depth_attachment_format(depth_format),
                         )],
                     None,
                 )
@@ -448,7 +463,8 @@ impl RenderingContext {
     pub fn begin_rendering(
         &self,
         command_buffer: vk::CommandBuffer,
-        view: vk::ImageView,
+        color_view: vk::ImageView,
+        depth_view: vk::ImageView,
         clear_color: vk::ClearColorValue,
         render_area: vk::Rect2D,
     ) {
@@ -458,11 +474,24 @@ impl RenderingContext {
                 &vk::RenderingInfo::default()
                     .layer_count(1)
                     .color_attachments(&[vk::RenderingAttachmentInfo::default()
-                        .image_view(view)
+                        .image_view(color_view)
                         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                         .clear_value(vk::ClearValue { color: clear_color })
                         .load_op(vk::AttachmentLoadOp::CLEAR)
                         .store_op(vk::AttachmentStoreOp::STORE)])
+                    .depth_attachment(
+                        &RenderingAttachmentInfo::default()
+                            .image_view(depth_view)
+                            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                            .clear_value(vk::ClearValue {
+                                depth_stencil: vk::ClearDepthStencilValue {
+                                    depth: 1.0,
+                                    stencil: 0,
+                                },
+                            })
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::STORE),
+                    )
                     .render_area(render_area),
             );
         }
@@ -489,7 +518,8 @@ impl RenderingContext {
                 allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             })?;
 
-            self.device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+            self.device
+                .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
             Ok(AllocatedBuffer { buffer, allocation })
         }
     }
