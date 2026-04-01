@@ -6,7 +6,6 @@ struct Vertex {
 	float uv1;
 	vec3 normal;
 	float uv2;
-	vec3 color;
 }; 
 
 layout(buffer_reference, std430) readonly buffer VertexBuffer { 
@@ -25,7 +24,6 @@ layout(set = 0, binding = 0) uniform UniformBufferObject {
     mat4 proj;
 } ubo;
 
-layout(location = 0) out vec3 fragColor;
 layout(location = 1) out vec2 fragTexCoord;
 
 void main() {
@@ -34,6 +32,5 @@ void main() {
 
 	//output data
 	gl_Position =  ubo.proj * ubo.view * ubo.model * vec4(v.position, 1.0F);
-    fragColor = v.color;
 	fragTexCoord = vec2(v.uv1, v.uv2);
 }

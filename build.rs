@@ -29,8 +29,8 @@ fn main() -> Result<()> {
     // This tells Cargo to rerun this script if something in /res/ changes.
     println!("cargo:rerun-if-changed=res/*");
 
-    compile_and_output_shader("res/shaders/shader.frag", "shader.frag", "res/shaders/shader.frag.spv", ShaderKind::Fragment)?;
-    compile_and_output_shader("res/shaders/shader.vert", "shader.vert", "res/shaders/shader.vert.spv", ShaderKind::Vertex)?;
+    compile_and_output_shader("res/shaders/shader.frag", "shader.frag", "res/compiled_shaders/shader.frag.spv", ShaderKind::Fragment)?;
+    compile_and_output_shader("res/shaders/shader.vert", "shader.vert", "res/compiled_shaders/shader.vert.spv", ShaderKind::Vertex)?;
 
     let out_dir = env::var("OUT_DIR")?;
     let mut copy_options = CopyOptions::new();

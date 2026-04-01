@@ -203,7 +203,10 @@ impl RenderingContext {
                     .push_next(
                         &mut vk::PhysicalDeviceVulkan12Features::default()
                             .buffer_device_address(true)
-                            .descriptor_indexing(true),
+                            .descriptor_indexing(true)
+                            .descriptor_binding_sampled_image_update_after_bind(true)
+                            .descriptor_binding_variable_descriptor_count(true)
+                            .descriptor_binding_partially_bound(true),
                     ),
                 None,
             )?;
@@ -440,14 +443,14 @@ impl RenderingContext {
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                                 .layer_count(1)
                                 .base_array_layer(0)
-                                .layer_count(1),
+                                .mip_level(0)
                         )
                         .dst_subresource(
                             ImageSubresourceLayers::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                                 .layer_count(1)
                                 .base_array_layer(0)
-                                .layer_count(1),
+                                .mip_level(0)
                         )]),
             );
         }
@@ -532,7 +535,7 @@ impl RenderingContext {
                         .rasterization_state(
                             &vk::PipelineRasterizationStateCreateInfo::default()
                                 .polygon_mode(vk::PolygonMode::FILL)
-                                .cull_mode(vk::CullModeFlags::NONE)
+                                .cull_mode(vk::CullModeFlags::BACK)
                                 .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
                                 .line_width(1.0),
                         )

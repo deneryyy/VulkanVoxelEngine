@@ -1,10 +1,7 @@
 use std::{io::Cursor, sync::Arc};
 
 use anyhow::{Ok, Result};
-use ash::{
-    RawPtr,
-    vk::{self, ImageSubresourceLayers, Offset3D},
-};
+use ash::vk::{self, ImageSubresourceLayers, Offset3D};
 use gpu_allocator::vulkan::Allocator;
 use image::{ImageReader, Rgba};
 
@@ -19,15 +16,23 @@ pub struct Texture {
 }
 
 impl Texture {
-    pub fn load_texture(
+    pub fn load_texture_from_file(
         path: &str,
         context: Arc<RenderingContext>,
         allocator: &mut Allocator,
     ) -> Result<Texture> {
-        let img = ImageReader::new(Cursor::new(resources::load_binary(path)?))
+        Self::load_texture(resources::load_binary(path)?, context, allocator)
+    }
+
+    pub fn load_texture(
+        data: Vec<u8>,
+        context: Arc<RenderingContext>,
+        allocator: &mut Allocator,
+    ) -> Result<Texture> {
+        let img = ImageReader::new(Cursor::new(data))
             .with_guessed_format()?
             .decode()?;
-        let buffer = img.to_rgba32f();
+        let buffer = img.to_rgba8();
         let mut staging = context.create_buffer(
             allocator,
             (buffer.len() * std::mem::size_of::<Rgba<f32>>()) as u64,
@@ -46,7 +51,7 @@ impl Texture {
         let image = context.create_image(
             allocator,
             extent,
-            vk::Format::R32G32B32A32_SFLOAT,
+            vk::Format::R8G8B8A8_SRGB,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             vk::ImageAspectFlags::COLOR,
         )?;
@@ -97,8 +102,8 @@ impl Texture {
                 .max_sampler_anisotropy;
             context.device.create_sampler(
                 &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
                     .address_mode_u(vk::SamplerAddressMode::REPEAT)
                     .address_mode_v(vk::SamplerAddressMode::REPEAT)
                     .address_mode_w(vk::SamplerAddressMode::REPEAT)

@@ -1,3 +1,5 @@
+use ash::vk;
+
 pub fn load_string(file_name: &str) -> anyhow::Result<String> {
     let txt = {
         let path = std::path::Path::new(env!("OUT_DIR"))
@@ -28,4 +30,15 @@ pub fn load_spirv(file_name: &str) -> anyhow::Result<Vec<u32>> {
         std::fs::read(path)?
     };
     Ok(ash::util::read_spv(&mut std::io::Cursor::new(data))?)
+}
+
+pub fn load_shader_module(path: &str, device: &ash::Device) -> anyhow::Result<vk::ShaderModule> {
+    let binary_data = load_spirv(path)?;
+
+    unsafe {
+        Ok(device.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&binary_data),
+            None,
+        )?)
+    }
 }

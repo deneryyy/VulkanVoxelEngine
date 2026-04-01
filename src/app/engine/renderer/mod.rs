@@ -2,6 +2,7 @@ pub mod camera;
 pub mod context;
 pub mod descriptor;
 pub mod model;
+pub mod quad;
 pub mod swapchain;
 pub mod texture;
 pub mod vertex;
@@ -27,6 +28,7 @@ use crate::app::engine::{
         camera::Camera,
         context::{AllocatedBuffer, AllocatedImage, RenderingContext},
         descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
+        quad::Quad,
         swapchain::Swapchain,
         texture::Texture,
         vertex::Vertex,
@@ -36,8 +38,8 @@ use crate::app::engine::{
 use ash::vk::{self, CommandBufferUsageFlags, ExtendsDescriptorSetLayoutCreateInfo};
 
 pub struct Frame {
-    uniform_buffer_descriptors: vk::DescriptorSet,
-    uniform_buffer_descriptor_layout: vk::DescriptorSetLayout,
+    descriptors: vk::DescriptorSet,
+    descriptor_layout: vk::DescriptorSetLayout,
     uniform_buffer: AllocatedBuffer,
     in_flight_fence: vk::Fence,
     image_available_semaphore: vk::Semaphore,
@@ -66,6 +68,7 @@ pub struct Renderer {
     allocator: Allocator,
     camera: Camera,
     texture: Texture,
+    indices: Vec<u32>,
     gpu_mesh_buffers: GPUMeshBuffers,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
@@ -93,8 +96,14 @@ impl Renderer {
             allocation_sizes: Default::default(),
         })?;
 
-        let texture =
-            Texture::load_texture("textures/texture.jpg", context.clone(), &mut allocator)?;
+        let grass_texture =
+            Texture::load_texture_from_file("textures/grass.png", context.clone(), &mut allocator)?;
+        let stone_texture = Texture::load_texture_from_file(
+            "textures/stone.webp",
+            context.clone(),
+            &mut allocator,
+        )?;
+        let supported_textures: u32 = 16536;
 
         let sizes = Vec::from([
             PoolSizeRatio {
@@ -103,7 +112,7 @@ impl Renderer {
             },
             PoolSizeRatio {
                 desc_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                ratio: 1,
+                ratio: supported_textures,
             },
         ]);
         let global_descriptor_allocator =
@@ -157,25 +166,33 @@ impl Renderer {
                 descriptor_layout_builder.add_binding(
                     0,
                     vk::DescriptorType::UNIFORM_BUFFER,
+                    1,
                     vk::ShaderStageFlags::VERTEX,
+                    vk::DescriptorBindingFlags::empty(),
                 );
                 descriptor_layout_builder.add_binding(
                     1,
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    supported_textures,
                     vk::ShaderStageFlags::FRAGMENT,
+                    vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                        | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
+                        | vk::DescriptorBindingFlags::PARTIALLY_BOUND,
                 );
 
-                let uniform_buffer_descriptor_layout =
-                    descriptor_layout_builder.build(&context.device)?;
+                let descriptor_layout = descriptor_layout_builder.build(&context.device)?;
 
-                let uniform_buffer_descriptors = global_descriptor_allocator
-                    .allocate(&context.device, uniform_buffer_descriptor_layout)?;
+                let descriptors = global_descriptor_allocator.allocate(
+                    &context.device,
+                    descriptor_layout,
+                    &[supported_textures],
+                )?;
 
                 context.device.update_descriptor_sets(
                     &[
                         vk::WriteDescriptorSet::default()
                             .dst_binding(0)
-                            .dst_set(uniform_buffer_descriptors)
+                            .dst_set(descriptors)
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                             .descriptor_count(1)
                             .buffer_info(&[vk::DescriptorBufferInfo::default()
@@ -183,20 +200,31 @@ impl Renderer {
                                 .range(std::mem::size_of::<UniformBufferObject>() as u64)]),
                         vk::WriteDescriptorSet::default()
                             .dst_binding(1)
-                            .dst_set(uniform_buffer_descriptors)
+                            .dst_set(descriptors)
+                            .dst_array_element(0)
                             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                             .descriptor_count(1)
                             .image_info(&[vk::DescriptorImageInfo::default()
-                                .image_view(texture.image.image_view)
-                                .sampler(texture.sampler)
+                                .image_view(grass_texture.image.image_view)
+                                .sampler(grass_texture.sampler)
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_binding(1)
+                            .dst_set(descriptors)
+                            .dst_array_element(1)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1)
+                            .image_info(&[vk::DescriptorImageInfo::default()
+                                .image_view(stone_texture.image.image_view)
+                                .sampler(stone_texture.sampler)
                                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
                     ],
                     &[],
                 );
 
                 frames.push(Frame {
-                    uniform_buffer_descriptors,
-                    uniform_buffer_descriptor_layout,
+                    descriptors,
+                    descriptor_layout,
                     uniform_buffer,
                     image_available_semaphore,
                     in_flight_fence,
@@ -207,7 +235,7 @@ impl Renderer {
 
             let descriptor_set_layouts = frames
                 .iter()
-                .map(|frame| return frame.uniform_buffer_descriptor_layout)
+                .map(|frame| return frame.descriptor_layout)
                 .collect::<Vec<_>>();
             let pipeline_layout = context.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -220,9 +248,9 @@ impl Renderer {
             )?;
 
             let vertex_shader =
-                Self::load_shader_module("shaders/shader.vert.spv", &context.device)?;
+                resources::load_shader_module("compiled_shaders/shader.vert.spv", &context.device)?;
             let fragment_shader =
-                Self::load_shader_module("shaders/shader.frag.spv", &context.device)?;
+                resources::load_shader_module("compiled_shaders/shader.frag.spv", &context.device)?;
             let pipeline = context.create_graphics_pipeline(
                 vk::Extent2D::default()
                     .width(swapchain.draw_image.extent.width)
@@ -237,41 +265,75 @@ impl Renderer {
             context.device.destroy_shader_module(vertex_shader, None);
             context.device.destroy_shader_module(fragment_shader, None);
 
-            let vertices = &[
-                Vertex::new(
-                    [-0.5, -0.5, -0.5],
-                    [0.0, 0.0, 0.0],
-                    [0.0, 1.0, 1.0],
-                    1.0,
-                    0.0,
-                ),
-                Vertex::new(
-                    [0.5, -0.5, -0.5],
-                    [0.0, 0.0, 0.0],
-                    [0.5, 0.5, 0.5],
-                    0.0,
-                    0.0,
-                ),
-                Vertex::new([0.5, 0.5, -0.5], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0], 0.0, 1.0),
-                Vertex::new(
-                    [-0.5, 0.5, -0.5],
-                    [0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
-                    1.0,
-                    1.0,
-                ),
-                Vertex::new(
-                    [-0.5, -0.5, 0.5],
-                    [0.0, 0.0, 0.0],
-                    [0.0, 1.0, 1.0],
-                    1.0,
-                    0.0,
-                ),
-                Vertex::new([0.5, -0.5, 0.5], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5], 0.0, 0.0),
-                Vertex::new([0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0], 0.0, 1.0),
-                Vertex::new([-0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 1.0, 1.0),
-            ];
-            let indices: &[u32] = &[0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4];
+            let mut vertices = Vec::new();
+            vertices.extend_from_slice(
+                &Quad::get_quad(
+                    quad::Direction::X_PLUS,
+                    Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                )
+                .vertices,
+            );
+            vertices.extend_from_slice(
+                &Quad::get_quad(
+                    quad::Direction::X_MINUS,
+                    Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                )
+                .vertices,
+            );
+            vertices.extend_from_slice(
+                &Quad::get_quad(
+                    quad::Direction::Z_PLUS,
+                    Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                )
+                .vertices,
+            );
+            vertices.extend_from_slice(
+                &Quad::get_quad(
+                    quad::Direction::Z_MINUS,
+                    Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                )
+                .vertices,
+            );
+            vertices.extend_from_slice(
+                &Quad::get_quad(
+                    quad::Direction::Y_PLUS,
+                    Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                )
+                .vertices,
+            );
+            vertices.extend_from_slice(
+                &Quad::get_quad(
+                    quad::Direction::Y_MINUS,
+                    Vec3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                )
+                .vertices,
+            );
+
+            let indices = Vertex::generate_indices(vertices.len());
 
             let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as u64;
 
@@ -386,7 +448,8 @@ impl Renderer {
             Ok(Self {
                 allocator,
                 camera,
-                texture,
+                texture: grass_texture,
+                indices,
                 gpu_mesh_buffers,
                 pipeline,
                 pipeline_layout,
@@ -404,17 +467,6 @@ impl Renderer {
         self.swapchain.resize()
     }
 
-    fn load_shader_module(path: &str, device: &ash::Device) -> Result<vk::ShaderModule> {
-        let binary_data = resources::load_spirv(path)?;
-
-        unsafe {
-            Ok(device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&binary_data),
-                None,
-            )?)
-        }
-    }
-
     pub fn render(&mut self) -> Result<()> {
         unsafe {
             let frame = &mut self.frames[self.frame_number % FRAME_OVERLAP];
@@ -428,7 +480,8 @@ impl Renderer {
             proj.y_axis.y *= -1.0;
 
             let ubo = UniformBufferObject {
-                model: glam::Mat4::from_rotation_x(45.0 + (self.frame_number as f32) * 0.01),
+                //model: glam::Mat4::from_rotation_x(45.0 + (self.frame_number as f32) * 0.01),
+                model: glam::Mat4::IDENTITY,
                 view: self.camera.get_view_matrix(),
                 proj,
             };
@@ -551,13 +604,18 @@ impl Renderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
                 0,
-                &[frame.uniform_buffer_descriptors],
+                &[frame.descriptors],
                 &[],
             );
 
-            self.context
-                .device
-                .cmd_draw_indexed(frame.command_buffer, 12, 1, 0, 0, 0);
+            self.context.device.cmd_draw_indexed(
+                frame.command_buffer,
+                self.indices.len() as u32,
+                1,
+                0,
+                0,
+                0,
+            );
 
             self.context.device.cmd_end_rendering(frame.command_buffer);
 
@@ -663,7 +721,7 @@ impl Drop for Renderer {
                     .destroy_buffer(&mut self.allocator, &mut frame.uniform_buffer);
                 self.context
                     .device
-                    .destroy_descriptor_set_layout(frame.uniform_buffer_descriptor_layout, None);
+                    .destroy_descriptor_set_layout(frame.descriptor_layout, None);
             });
 
             self.global_descriptor_allocator
