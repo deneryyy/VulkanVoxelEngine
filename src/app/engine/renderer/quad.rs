@@ -74,4 +74,75 @@ impl Quad {
         }
         return quad;
     }
+
+    pub fn get_full_block_vertices() -> Vec<Vertex> {
+        let mut vertices = Vec::new();
+        vertices.extend_from_slice(
+            &Quad::get_quad(
+                Direction::X_PLUS,
+                Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            )
+            .vertices,
+        );
+        vertices.extend_from_slice(
+            &Quad::get_quad(
+                Direction::X_MINUS,
+                Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            )
+            .vertices,
+        );
+        vertices.extend_from_slice(
+            &Quad::get_quad(
+                Direction::Z_PLUS,
+                Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            )
+            .vertices,
+        );
+        vertices.extend_from_slice(
+            &Quad::get_quad(
+                Direction::Z_MINUS,
+                Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            )
+            .vertices,
+        );
+        vertices.extend_from_slice(
+            &Quad::get_quad(
+                Direction::Y_PLUS,
+                Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            )
+            .vertices,
+        );
+        vertices.extend_from_slice(
+            &Quad::get_quad(
+                Direction::Y_MINUS,
+                Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            )
+            .vertices,
+        );
+        vertices
+    }
 }

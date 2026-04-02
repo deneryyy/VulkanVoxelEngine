@@ -7,6 +7,7 @@ pub mod swapchain;
 pub mod texture;
 pub mod vertex;
 
+use core::alloc;
 use std::{io::Cursor, sync::Arc, u32};
 
 use anyhow::{Ok, Result};
@@ -47,29 +48,40 @@ pub struct Frame {
     command_pool: vk::CommandPool,
 }
 
-struct GPUMeshBuffers {
-    vertex_buffer_address: vk::DeviceAddress,
-    index_buffer: AllocatedBuffer,
-    vertex_buffer: AllocatedBuffer,
-}
-
 #[repr(C, align(16))]
 struct GPUDrawPushConstants {
     vertex_buffer: vk::DeviceAddress,
+    matrix_buffer: vk::DeviceAddress,
+    material_id: u32,
+    render_object_id: u32,
 }
 
 struct UniformBufferObject {
-    model: glam::Mat4,
     view: glam::Mat4,
     proj: glam::Mat4,
+}
+
+struct RenderObject {
+    index_count: u32,
+    first_index: u32,
+    material: u32,
+    index_buffer: AllocatedBuffer,
+    vertex_buffer: AllocatedBuffer,
+    transform: glam::Mat4,
+    vertex_buffer_address: vk::DeviceAddress,
+}
+
+struct Matrix {
+    model: glam::Mat4,
 }
 
 pub struct Renderer {
     allocator: Allocator,
     camera: Camera,
-    texture: Texture,
-    indices: Vec<u32>,
-    gpu_mesh_buffers: GPUMeshBuffers,
+    textures: Vec<Texture>,
+    render_objects: Vec<RenderObject>,
+    matrix_buffer_address: vk::DeviceAddress,
+    matrix_buffer: AllocatedBuffer,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     global_descriptor_allocator: DescriptorAllocator,
@@ -96,6 +108,7 @@ impl Renderer {
             allocation_sizes: Default::default(),
         })?;
 
+        let mut textures: Vec<Texture> = Vec::new();
         let grass_texture =
             Texture::load_texture_from_file("textures/grass.png", context.clone(), &mut allocator)?;
         let stone_texture = Texture::load_texture_from_file(
@@ -103,6 +116,8 @@ impl Renderer {
             context.clone(),
             &mut allocator,
         )?;
+        textures.push(grass_texture);
+        textures.push(stone_texture);
         let supported_textures: u32 = 16536;
 
         let sizes = Vec::from([
@@ -127,6 +142,109 @@ impl Renderer {
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
                 render_finished_semaphores.push(render_finished_semaphore);
             }
+
+            let mut render_objects = Vec::new();
+            let vertices1 = Quad::get_full_block_vertices();
+            let vertices2 = Quad::get_full_block_vertices();
+
+            let indices1 = Vertex::generate_indices(vertices1.len());
+            let indices2 = Vertex::generate_indices(vertices2.len());
+            let indices1_len = indices1.len();
+            let indices2_len = indices2.len();
+
+            let buffers1 = Vertex::create_vertex_and_index_buffers(
+                context.clone(),
+                &mut allocator,
+                vertices1,
+                indices1,
+            )?;
+            let buffers2 = Vertex::create_vertex_and_index_buffers(
+                context.clone(),
+                &mut allocator,
+                vertices2,
+                indices2,
+            )?;
+
+            render_objects.push(RenderObject {
+                first_index: 0,
+                index_count: indices1_len as u32,
+                material: 0,
+                index_buffer: buffers1.1,
+                vertex_buffer: buffers1.0,
+                transform: Mat4::IDENTITY,
+                vertex_buffer_address: buffers1.2,
+            });
+            render_objects.push(RenderObject {
+                first_index: 0,
+                index_count: indices2_len as u32,
+                material: 1,
+                index_buffer: buffers2.1,
+                vertex_buffer: buffers2.0,
+                transform: Mat4::from_translation(glam::Vec3 {
+                    x: 0.0,
+                    y: 2.0,
+                    z: 0.0,
+                }),
+                vertex_buffer_address: buffers2.2,
+            });
+
+            let matrices = render_objects
+                .iter()
+                .map(|render_object| Matrix {
+                    model: render_object.transform,
+                })
+                .collect::<Vec<_>>();
+            let matrix_buffer_size = (matrices.len() * std::mem::size_of::<Matrix>()) as u64;
+            let matrix_buffer = context.create_buffer(
+                &mut allocator,
+                matrix_buffer_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                gpu_allocator::MemoryLocation::GpuOnly,
+            )?;
+            let mut staging = context.create_buffer(
+                &mut allocator,
+                matrix_buffer_size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            )?;
+
+            let data = staging.allocation.mapped_ptr().unwrap().as_ptr();
+            std::ptr::copy_nonoverlapping(matrices.as_ptr(), data.cast(), matrices.len());
+
+            let cmd = context.begin_immediate_submit()?;
+
+            context.device.cmd_copy_buffer(
+                cmd,
+                staging.buffer,
+                matrix_buffer.buffer,
+                &[vk::BufferCopy::default()
+                    .dst_offset(0)
+                    .src_offset(0)
+                    .size(matrix_buffer_size)],
+            );
+            context.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&[
+                    vk::BufferMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(matrix_buffer.buffer)
+                        .size(matrix_buffer_size),
+                ]),
+            );
+            context.end_immediate_submit()?;
+
+            let matrix_buffer_address = context.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(matrix_buffer.buffer),
+            );
+
+            context.destroy_buffer(&mut allocator, &mut staging);
 
             let mut frames: Vec<Frame> = Vec::with_capacity(FRAME_OVERLAP);
             for i in 0..FRAME_OVERLAP {
@@ -188,39 +306,37 @@ impl Renderer {
                     &[supported_textures],
                 )?;
 
-                context.device.update_descriptor_sets(
-                    &[
-                        vk::WriteDescriptorSet::default()
-                            .dst_binding(0)
-                            .dst_set(descriptors)
-                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1)
-                            .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(uniform_buffer.buffer)
-                                .range(std::mem::size_of::<UniformBufferObject>() as u64)]),
-                        vk::WriteDescriptorSet::default()
-                            .dst_binding(1)
-                            .dst_set(descriptors)
-                            .dst_array_element(0)
-                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(1)
-                            .image_info(&[vk::DescriptorImageInfo::default()
-                                .image_view(grass_texture.image.image_view)
-                                .sampler(grass_texture.sampler)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
-                        vk::WriteDescriptorSet::default()
-                            .dst_binding(1)
-                            .dst_set(descriptors)
-                            .dst_array_element(1)
-                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(1)
-                            .image_info(&[vk::DescriptorImageInfo::default()
-                                .image_view(stone_texture.image.image_view)
-                                .sampler(stone_texture.sampler)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
-                    ],
-                    &[],
+                let mut desc_writes: Vec<vk::WriteDescriptorSet> = Vec::new();
+                let uniform_desc_info = &[vk::DescriptorBufferInfo::default()
+                    .buffer(uniform_buffer.buffer)
+                    .range(std::mem::size_of::<UniformBufferObject>() as u64)];
+                desc_writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(0)
+                        .dst_set(descriptors)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(uniform_desc_info),
                 );
+                let image_infos: Vec<vk::DescriptorImageInfo> = textures
+                    .iter()
+                    .map(|tex| {
+                        vk::DescriptorImageInfo::default()
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                            .image_view(tex.image.image_view)
+                            .sampler(tex.sampler)
+                    })
+                    .collect();
+
+                let tex_write = vk::WriteDescriptorSet::default()
+                    .dst_binding(1)
+                    .dst_set(descriptors)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .image_info(&image_infos);
+                desc_writes.push(tex_write);
+
+                context.device.update_descriptor_sets(&desc_writes, &[]);
 
                 frames.push(Frame {
                     descriptors,
@@ -265,170 +381,6 @@ impl Renderer {
             context.device.destroy_shader_module(vertex_shader, None);
             context.device.destroy_shader_module(fragment_shader, None);
 
-            let mut vertices = Vec::new();
-            vertices.extend_from_slice(
-                &Quad::get_quad(
-                    quad::Direction::X_PLUS,
-                    Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                )
-                .vertices,
-            );
-            vertices.extend_from_slice(
-                &Quad::get_quad(
-                    quad::Direction::X_MINUS,
-                    Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                )
-                .vertices,
-            );
-            vertices.extend_from_slice(
-                &Quad::get_quad(
-                    quad::Direction::Z_PLUS,
-                    Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                )
-                .vertices,
-            );
-            vertices.extend_from_slice(
-                &Quad::get_quad(
-                    quad::Direction::Z_MINUS,
-                    Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                )
-                .vertices,
-            );
-            vertices.extend_from_slice(
-                &Quad::get_quad(
-                    quad::Direction::Y_PLUS,
-                    Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                )
-                .vertices,
-            );
-            vertices.extend_from_slice(
-                &Quad::get_quad(
-                    quad::Direction::Y_MINUS,
-                    Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                )
-                .vertices,
-            );
-
-            let indices = Vertex::generate_indices(vertices.len());
-
-            let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as u64;
-
-            let vertex_buffer = context.create_buffer(
-                &mut allocator,
-                vertex_buffer_size,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                gpu_allocator::MemoryLocation::GpuOnly,
-            )?;
-
-            let index_buffer_size = (indices.len() * std::mem::size_of::<u32>()) as u64;
-            let index_buffer = context.create_buffer(
-                &mut allocator,
-                index_buffer_size,
-                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                gpu_allocator::MemoryLocation::GpuOnly,
-            )?;
-
-            let mut staging = context.create_buffer(
-                &mut allocator,
-                vertex_buffer_size + index_buffer_size,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                gpu_allocator::MemoryLocation::CpuToGpu,
-            )?;
-
-            let data = staging.allocation.mapped_ptr().unwrap().as_ptr();
-            std::ptr::copy_nonoverlapping(vertices.as_ptr(), data.cast(), vertices.len());
-            std::ptr::copy_nonoverlapping(
-                indices.as_ptr(),
-                data.cast::<u32>().byte_add(vertex_buffer_size as usize),
-                indices.len(),
-            );
-
-            let cmd = context.begin_immediate_submit()?;
-
-            context.device.cmd_copy_buffer(
-                cmd,
-                staging.buffer,
-                vertex_buffer.buffer,
-                &[vk::BufferCopy::default()
-                    .dst_offset(0)
-                    .src_offset(0)
-                    .size(vertex_buffer_size)],
-            );
-            context.device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&[
-                    vk::BufferMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
-                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(vertex_buffer.buffer)
-                        .size(vertex_buffer_size),
-                ]),
-            );
-            context.device.cmd_copy_buffer(
-                cmd,
-                staging.buffer,
-                index_buffer.buffer,
-                &[vk::BufferCopy::default()
-                    .dst_offset(0)
-                    .src_offset(vertex_buffer_size)
-                    .size(index_buffer_size)],
-            );
-            context.device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&[
-                    vk::BufferMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
-                        .dst_access_mask(vk::AccessFlags2::INDEX_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(index_buffer.buffer)
-                        .size(index_buffer_size),
-                ]),
-            );
-
-            context.end_immediate_submit()?;
-            let vertex_buffer_address = context.device.get_buffer_device_address(
-                &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
-            );
-            context.destroy_buffer(&mut allocator, &mut staging);
-            let gpu_mesh_buffers = GPUMeshBuffers {
-                vertex_buffer_address,
-                vertex_buffer,
-                index_buffer,
-            };
-
             let camera = Camera::new(
                 Vec3 {
                     x: 2.0,
@@ -448,9 +400,10 @@ impl Renderer {
             Ok(Self {
                 allocator,
                 camera,
-                texture: grass_texture,
-                indices,
-                gpu_mesh_buffers,
+                textures,
+                render_objects,
+                matrix_buffer_address,
+                matrix_buffer,
                 pipeline,
                 pipeline_layout,
                 global_descriptor_allocator,
@@ -467,9 +420,8 @@ impl Renderer {
         self.swapchain.resize()
     }
 
-    pub fn render(&mut self) -> Result<()> {
+    fn upload_uniform_buffer(&self, frame: &Frame) {
         unsafe {
-            let frame = &mut self.frames[self.frame_number % FRAME_OVERLAP];
             let mut proj = glam::Mat4::perspective_rh(
                 45.0,
                 self.swapchain.draw_image.extent.width as f32
@@ -480,8 +432,6 @@ impl Renderer {
             proj.y_axis.y *= -1.0;
 
             let ubo = UniformBufferObject {
-                //model: glam::Mat4::from_rotation_x(45.0 + (self.frame_number as f32) * 0.01),
-                model: glam::Mat4::IDENTITY,
                 view: self.camera.get_view_matrix(),
                 proj,
             };
@@ -492,7 +442,13 @@ impl Renderer {
                 .unwrap()
                 .as_ptr();
             std::ptr::copy_nonoverlapping(&ubo, ubo_ptr.cast(), 1);
+        }
+    }
 
+    pub fn render(&mut self) -> Result<()> {
+        unsafe {
+            let frame = &self.frames[self.frame_number % FRAME_OVERLAP];
+            self.upload_uniform_buffer(frame);
             // Wait until gpu finished rendering last frame
             self.context
                 .device
@@ -579,43 +535,48 @@ impl Renderer {
                 self.pipeline,
             );
 
-            let push_constants = GPUDrawPushConstants {
-                vertex_buffer: self.gpu_mesh_buffers.vertex_buffer_address,
-            };
-            self.context.device.cmd_push_constants(
-                frame.command_buffer,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                std::slice::from_raw_parts(
-                    &push_constants as *const _ as *const u8,
-                    std::mem::size_of::<GPUDrawPushConstants>(),
-                ),
-            );
-            self.context.device.cmd_bind_index_buffer(
-                frame.command_buffer,
-                self.gpu_mesh_buffers.index_buffer.buffer,
-                0,
-                vk::IndexType::UINT32,
-            );
+            for (i, render_object) in self.render_objects.iter().enumerate() {
+                let push_constants = GPUDrawPushConstants {
+                    vertex_buffer: render_object.vertex_buffer_address,
+                    matrix_buffer: self.matrix_buffer_address,
+                    material_id: render_object.material,
+                    render_object_id: i as u32,
+                };
+                self.context.device.cmd_push_constants(
+                    frame.command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    std::slice::from_raw_parts(
+                        &push_constants as *const _ as *const u8,
+                        std::mem::size_of::<GPUDrawPushConstants>(),
+                    ),
+                );
+                self.context.device.cmd_bind_index_buffer(
+                    frame.command_buffer,
+                    render_object.index_buffer.buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
 
-            self.context.device.cmd_bind_descriptor_sets(
-                frame.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[frame.descriptors],
-                &[],
-            );
+                self.context.device.cmd_bind_descriptor_sets(
+                    frame.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[frame.descriptors],
+                    &[],
+                );
 
-            self.context.device.cmd_draw_indexed(
-                frame.command_buffer,
-                self.indices.len() as u32,
-                1,
-                0,
-                0,
-                0,
-            );
+                self.context.device.cmd_draw_indexed(
+                    frame.command_buffer,
+                    render_object.index_count,
+                    1,
+                    render_object.first_index,
+                    0,
+                    0,
+                );
+            }
 
             self.context.device.cmd_end_rendering(frame.command_buffer);
 
@@ -732,14 +693,16 @@ impl Drop for Renderer {
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.context.device.destroy_pipeline(self.pipeline, None);
 
-            self.context.destroy_buffer(
-                &mut self.allocator,
-                &mut self.gpu_mesh_buffers.vertex_buffer,
-            );
-            self.context
-                .destroy_buffer(&mut self.allocator, &mut self.gpu_mesh_buffers.index_buffer);
-
-            Texture::destroy_texture(self.context.clone(), &mut self.allocator, &mut self.texture);
+            self.context.destroy_buffer(&mut self.allocator, &mut self.matrix_buffer);
+            for render_object in &mut self.render_objects {
+                self.context
+                    .destroy_buffer(&mut self.allocator, &mut render_object.vertex_buffer);
+                self.context
+                    .destroy_buffer(&mut self.allocator, &mut render_object.index_buffer);
+            }
+            for texture in &mut self.textures {
+                Texture::destroy_texture(self.context.clone(), &mut self.allocator, texture);
+            }
         }
     }
 }
