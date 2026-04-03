@@ -1,20 +1,26 @@
 pub mod renderer;
 pub mod resources;
 
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use anyhow::{Ok, Result};
 use winit::{
-    dpi::LogicalPosition,
-    event::{DeviceEvent, KeyEvent, RawKeyEvent, WindowEvent},
+    event::{DeviceEvent, KeyEvent, WindowEvent},
     event_loop::ActiveEventLoop,
     keyboard::PhysicalKey,
-    window::{Window, WindowId},
+    window::{Window},
 };
 
-use crate::app::engine::renderer::{Renderer, context::RenderingContext};
+use crate::app::{
+    engine::renderer::{Renderer, context::RenderingContext},
+    game::{Game, world::World},
+};
 
 pub struct Engine {
+    world: Arc<Mutex<World>>,
     renderer: Renderer,
     window: Arc<Window>,
     context: Arc<RenderingContext>,
@@ -22,12 +28,20 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
+        let world = Arc::new(Mutex::new(World::new()));
+        let world_ = world.clone();
+        thread::spawn(move || {
+            let mut game = Game::new(world_);
+            game.start_game();
+        });
+
         let window = Arc::new(event_loop.create_window(Default::default())?);
         window.set_cursor_visible(false);
         window.set_cursor_grab(winit::window::CursorGrabMode::Locked)?;
         let context = Arc::new(RenderingContext::new(window.clone())?);
-        let renderer = Renderer::new(context.clone(), window.clone())?;
+        let renderer = Renderer::new(context.clone(), window.clone(), world.clone())?;
         Ok(Self {
+            world,
             renderer,
             window,
             context,

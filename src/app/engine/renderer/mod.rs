@@ -8,7 +8,11 @@ pub mod texture;
 pub mod vertex;
 
 use core::alloc;
-use std::{io::Cursor, sync::Arc, u32};
+use std::{
+    io::Cursor,
+    sync::{Arc, Mutex},
+    u32,
+};
 
 use anyhow::{Ok, Result};
 use glam::{Mat4, Vec3, Vec3Swizzles};
@@ -24,17 +28,20 @@ use winit::{
     window::Window,
 };
 
-use crate::app::engine::{
-    renderer::{
-        camera::Camera,
-        context::{AllocatedBuffer, AllocatedImage, RenderingContext},
-        descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
-        quad::Quad,
-        swapchain::Swapchain,
-        texture::Texture,
-        vertex::Vertex,
+use crate::app::{
+    engine::{
+        renderer::{
+            camera::Camera,
+            context::{AllocatedBuffer, AllocatedImage, RenderingContext},
+            descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
+            quad::Quad,
+            swapchain::Swapchain,
+            texture::Texture,
+            vertex::Vertex,
+        },
+        resources,
     },
-    resources,
+    game::world::World,
 };
 use ash::vk::{self, CommandBufferUsageFlags, ExtendsDescriptorSetLayoutCreateInfo};
 
@@ -61,7 +68,7 @@ struct UniformBufferObject {
     proj: glam::Mat4,
 }
 
-struct RenderObject {
+pub struct RenderObject {
     index_count: u32,
     first_index: u32,
     material: u32,
@@ -95,7 +102,11 @@ pub struct Renderer {
 const FRAME_OVERLAP: usize = 2;
 
 impl Renderer {
-    pub fn new(context: Arc<RenderingContext>, window: Arc<Window>) -> Result<Self> {
+    pub fn new(
+        context: Arc<RenderingContext>,
+        window: Arc<Window>,
+        world: Arc<Mutex<World>>,
+    ) -> Result<Self> {
         let mut swapchain = Swapchain::new(context.clone(), window.clone())?;
         swapchain.resize()?;
 
@@ -118,7 +129,7 @@ impl Renderer {
         )?;
         textures.push(grass_texture);
         textures.push(stone_texture);
-        let supported_textures: u32 = 16536;
+        let supported_textures: u32 = textures.len() as u32;
 
         let sizes = Vec::from([
             PoolSizeRatio {
@@ -144,49 +155,31 @@ impl Renderer {
             }
 
             let mut render_objects = Vec::new();
-            let vertices1 = Quad::get_full_block_vertices();
-            let vertices2 = Quad::get_full_block_vertices();
-
-            let indices1 = Vertex::generate_indices(vertices1.len());
-            let indices2 = Vertex::generate_indices(vertices2.len());
-            let indices1_len = indices1.len();
-            let indices2_len = indices2.len();
-
-            let buffers1 = Vertex::create_vertex_and_index_buffers(
-                context.clone(),
-                &mut allocator,
-                vertices1,
-                indices1,
-            )?;
-            let buffers2 = Vertex::create_vertex_and_index_buffers(
-                context.clone(),
-                &mut allocator,
-                vertices2,
-                indices2,
-            )?;
-
-            render_objects.push(RenderObject {
-                first_index: 0,
-                index_count: indices1_len as u32,
-                material: 0,
-                index_buffer: buffers1.1,
-                vertex_buffer: buffers1.0,
-                transform: Mat4::IDENTITY,
-                vertex_buffer_address: buffers1.2,
-            });
-            render_objects.push(RenderObject {
-                first_index: 0,
-                index_count: indices2_len as u32,
-                material: 1,
-                index_buffer: buffers2.1,
-                vertex_buffer: buffers2.0,
-                transform: Mat4::from_translation(glam::Vec3 {
-                    x: 0.0,
-                    y: 2.0,
-                    z: 0.0,
-                }),
-                vertex_buffer_address: buffers2.2,
-            });
+            for chunk_mesh in world.lock().unwrap().get_world_meshes() {
+                let verts = chunk_mesh.vertices;
+                let indices = Vertex::generate_indices(verts.len());
+                let indices_len = indices.len();
+                let buffers = Vertex::create_vertex_and_index_buffers(
+                    context.clone(),
+                    &mut allocator,
+                    verts,
+                    indices,
+                )
+                .unwrap();
+                render_objects.push(RenderObject {
+                    index_count: indices_len as u32,
+                    first_index: 0,
+                    material: chunk_mesh.material,
+                    index_buffer: buffers.1,
+                    vertex_buffer: buffers.0,
+                    transform: glam::Mat4::from_translation(Vec3 {
+                        x: (chunk_mesh.chunk_pos.x * 16) as f32,
+                        y: (chunk_mesh.chunk_pos.y * 16) as f32,
+                        z: (chunk_mesh.chunk_pos.z * 16) as f32,
+                    }),
+                    vertex_buffer_address: buffers.2,
+                });
+            }
 
             let matrices = render_objects
                 .iter()
@@ -693,7 +686,8 @@ impl Drop for Renderer {
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.context.device.destroy_pipeline(self.pipeline, None);
 
-            self.context.destroy_buffer(&mut self.allocator, &mut self.matrix_buffer);
+            self.context
+                .destroy_buffer(&mut self.allocator, &mut self.matrix_buffer);
             for render_object in &mut self.render_objects {
                 self.context
                     .destroy_buffer(&mut self.allocator, &mut render_object.vertex_buffer);

@@ -1,9 +1,11 @@
 mod app;
 
+use std::thread;
+
 use anyhow::Result;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-use crate::app::App;
+use crate::app::{App, game::Game};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();

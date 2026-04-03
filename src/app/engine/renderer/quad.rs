@@ -6,7 +6,8 @@ pub struct Quad {
     pub vertices: [Vertex; 4],
 }
 
-pub enum Direction {
+#[derive(Eq, PartialEq, Hash, Clone, Copy)]
+pub enum Face {
     Z_PLUS,
     Z_MINUS,
     Y_PLUS,
@@ -16,9 +17,9 @@ pub enum Direction {
 }
 
 impl Quad {
-    pub fn get_quad(direction: Direction, pos: Vec3) -> Quad {
-        let mut quad = match direction {
-            Direction::Z_PLUS => Quad {
+    pub fn get_quad(face: Face, pos: Vec3) -> Quad {
+        let mut quad = match face {
+            Face::Z_PLUS => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 0.0, 1.0),
                     Vertex::new([1.0, 0.0, 1.0], [0.0, 0.0, 1.0], 1.0, 1.0),
@@ -26,7 +27,7 @@ impl Quad {
                     Vertex::new([0.0, 1.0, 1.0], [0.0, 0.0, 1.0], 0.0, 0.0),
                 ],
             },
-            Direction::Z_MINUS => Quad {
+            Face::Z_MINUS => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], 1.0, 1.0),
                     Vertex::new([0.0, 1.0, 0.0], [0.0, 0.0, -1.0], 1.0, 0.0),
@@ -34,7 +35,7 @@ impl Quad {
                     Vertex::new([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], 0.0, 1.0),
                 ],
             },
-            Direction::X_PLUS => Quad {
+            Face::X_PLUS => Quad {
                 vertices: [
                     Vertex::new([1.0, 0.0, 0.0], [1.0, 0.0, 0.0], 1.0, 1.0),
                     Vertex::new([1.0, 1.0, 0.0], [1.0, 0.0, 0.0], 1.0, 0.0),
@@ -42,7 +43,7 @@ impl Quad {
                     Vertex::new([1.0, 0.0, 1.0], [1.0, 0.0, 0.0], 0.0, 1.0),
                 ],
             },
-            Direction::X_MINUS => Quad {
+            Face::X_MINUS => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 0.0], [-1.0, 0.0, 0.0], 0.0, 1.0),
                     Vertex::new([0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], 1.0, 1.0),
@@ -50,7 +51,7 @@ impl Quad {
                     Vertex::new([0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], 0.0, 0.0),
                 ],
             },
-            Direction::Y_PLUS => Quad {
+            Face::Y_PLUS => Quad {
                 vertices: [
                     Vertex::new([0.0, 1.0, 1.0], [0.0, 1.0, 0.0], 1.0, 0.0),
                     Vertex::new([1.0, 1.0, 1.0], [0.0, 1.0, 0.0], 0.0, 0.0),
@@ -58,7 +59,7 @@ impl Quad {
                     Vertex::new([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], 1.0, 1.0),
                 ],
             },
-            Direction::Y_MINUS => Quad {
+            Face::Y_MINUS => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 1.0], [0.0, -1.0, 0.0], 1.0, 0.0),
                     Vertex::new([0.0, 0.0, 0.0], [0.0, -1.0, 0.0], 1.0, 1.0),
@@ -79,7 +80,7 @@ impl Quad {
         let mut vertices = Vec::new();
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Direction::X_PLUS,
+                Face::X_PLUS,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -90,7 +91,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Direction::X_MINUS,
+                Face::X_MINUS,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -101,7 +102,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Direction::Z_PLUS,
+                Face::Z_PLUS,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -112,7 +113,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Direction::Z_MINUS,
+                Face::Z_MINUS,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -123,7 +124,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Direction::Y_PLUS,
+                Face::Y_PLUS,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -134,7 +135,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Direction::Y_MINUS,
+                Face::Y_MINUS,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
