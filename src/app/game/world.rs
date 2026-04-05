@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use glam::{IVec3, Vec3};
 use noise::{
-    Fbm, Perlin, core::perlin::perlin_3d, permutationtable::PermutationTable,
+    Fbm, NoiseFn, Perlin, core::perlin::perlin_3d, permutationtable::PermutationTable,
     utils::PlaneMapBuilder,
 };
 
@@ -39,24 +39,32 @@ impl World {
     }
 
     pub fn generate(&mut self) {
+        let perlin = Perlin::new(1);
         for i in -2..2 as i32 {
             for j in -2..2 as i32 {
-                let mut data = [1; 16 * 16 * 16];
-                data[0] = 0;
-                self.chunks
-                    .insert(IVec3 { x: i, y: 0, z: j }, Chunk { block_ids: data });
+                let mut chunk = Chunk {
+                    block_ids: [0; 16 * 16 * 16],
+                };
+                for x in 0..16 {
+                    for z in 0..16 {
+                        let point = (perlin.get([x as f64 / 32.0, z as f64 / 32.0]) * 16.0) as u32;
+
+                        chunk.write_block_id(x, point, z, 1);
+                    }
+                }
+                self.chunks.insert(IVec3 { x: i, y: 0, z: j }, chunk);
             }
         }
     }
 
     pub fn get_block_id(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        let chunk_x = (x.abs() % 16) as usize;
-        let chunk_y = (y.abs() % 16) as usize;
-        let chunk_z = (z.abs() % 16) as usize;
+        let chunk_x = x.rem_euclid(16) as usize;
+        let chunk_y = y.rem_euclid(16) as usize;
+        let chunk_z = z.rem_euclid(16) as usize;
         self.get_chunk(IVec3 {
-            x: x / 16,
-            y: y / 16,
-            z: z / 16,
+            x: x.div_euclid(16),
+            y: y.div_euclid(16),
+            z: z.div_euclid(16),
         })
         .map(|chunk| chunk.get_block_id(chunk_x, chunk_y, chunk_z))
     }
@@ -91,11 +99,11 @@ impl World {
         yn: i32,
         zn: i32,
     ) {
-        if self.should_render_face(
-            registry::BLOCK_REGISTRY
-                .get(self.get_block_id(xn, yn, zn).unwrap_or(0))
-                .unwrap(),
-        ) {
+        if self
+            .get_block_id(xn, yn, zn)
+            .map(|id| self.should_render_face(registry::BLOCK_REGISTRY.get(id).unwrap()))
+            .unwrap_or(false)
+        {
             let material = block_type.material_per_face.get(&face).unwrap();
             let quad = Quad::get_quad(
                 face,
