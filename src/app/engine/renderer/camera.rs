@@ -1,10 +1,12 @@
+use std::collections::HashSet;
+
 use winit::{
     event::{ElementState, KeyEvent},
     keyboard::{KeyCode, PhysicalKey},
 };
 
 pub struct Camera {
-    position: glam::Vec3,
+    pub position: glam::Vec3,
     front: glam::Vec3,
     up: glam::Vec3,
     right: glam::Vec3,
@@ -18,7 +20,7 @@ pub struct Camera {
 }
 
 const SENSIVITY: f32 = 0.1;
-const SPEED: f32 = 0.5;
+const SPEED: f32 = 20.0;
 const FOV: f32 = 90.0;
 
 impl Camera {
@@ -66,20 +68,26 @@ impl Camera {
         self.update_camera_vectors();
     }
 
-    pub fn process_key_movement(&mut self, key: KeyCode, state: ElementState) {
-        if key == KeyCode::KeyW && state.is_pressed() {
-            self.position += self.front * self.movement_speed;
-        } else if key == KeyCode::KeyS && state.is_pressed() {
-            self.position -= self.front * self.movement_speed;
-        } else if key == KeyCode::KeyA && state.is_pressed() {
-            self.position -= self.right * self.movement_speed;
-        } else if key == KeyCode::KeyD && state.is_pressed() {
-            self.position += self.right * self.movement_speed
-        } else if key == KeyCode::Space && state.is_pressed() {
-            self.position += self.world_up * self.movement_speed
-        } else if key == KeyCode::ShiftLeft && state.is_pressed() {
-            self.position -= self.world_up * self.movement_speed
+    pub fn process_keys(&mut self, pressed_keys: HashSet<KeyCode>, delta_time: f32) {
+        let mut movement = glam::Vec3::ZERO;
+
+        for key in pressed_keys {
+            match key {
+                KeyCode::KeyW => movement += self.front,
+                KeyCode::KeyS => movement -= self.front,
+                KeyCode::KeyD => movement += self.right,
+                KeyCode::KeyA => movement -= self.right,
+                KeyCode::Space => movement += self.world_up,
+                KeyCode::ShiftLeft => movement -= self.world_up,
+                _ => {}
+            }
         }
+
+        if movement.length_squared() > 0.0 {
+            movement = movement.normalize();
+        }
+
+        self.position += movement * self.movement_speed * delta_time;
     }
 
     fn update_camera_vectors(&mut self) {

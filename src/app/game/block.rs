@@ -17,22 +17,22 @@ impl BlockType {
 
     pub fn all_faces(material_id: u32) -> HashMap<Face, u32> {
         HashMap::from([
-            (Face::X_PLUS, material_id),
-            (Face::X_MINUS, material_id),
-            (Face::Y_PLUS, material_id),
-            (Face::Y_MINUS, material_id),
-            (Face::Z_PLUS, material_id),
-            (Face::Z_MINUS, material_id),
+            (Face::XPlus, material_id),
+            (Face::XMinus, material_id),
+            (Face::YPlus, material_id),
+            (Face::YMinus, material_id),
+            (Face::ZPlus, material_id),
+            (Face::ZMinus, material_id),
         ])
     }
     pub fn side_faces(material_id: u32, material_id2: u32) -> HashMap<Face, u32> {
         HashMap::from([
-            (Face::X_PLUS, material_id),
-            (Face::X_MINUS, material_id),
-            (Face::Y_PLUS, material_id2),
-            (Face::Y_MINUS, material_id2),
-            (Face::Z_PLUS, material_id),
-            (Face::Z_MINUS, material_id),
+            (Face::XPlus, material_id),
+            (Face::XMinus, material_id),
+            (Face::YPlus, material_id2),
+            (Face::YMinus, material_id2),
+            (Face::ZPlus, material_id),
+            (Face::ZMinus, material_id),
         ])
     }
 }

@@ -8,18 +8,18 @@ pub struct Quad {
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy)]
 pub enum Face {
-    Z_PLUS,
-    Z_MINUS,
-    Y_PLUS,
-    Y_MINUS,
-    X_PLUS,
-    X_MINUS,
+    ZPlus,
+    ZMinus,
+    YPlus,
+    YMinus,
+    XPlus,
+    XMinus,
 }
 
 impl Quad {
     pub fn get_quad(face: Face, pos: Vec3) -> Quad {
         let mut quad = match face {
-            Face::Z_PLUS => Quad {
+            Face::ZPlus => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 0.0, 1.0),
                     Vertex::new([1.0, 0.0, 1.0], [0.0, 0.0, 1.0], 1.0, 1.0),
@@ -27,7 +27,7 @@ impl Quad {
                     Vertex::new([0.0, 1.0, 1.0], [0.0, 0.0, 1.0], 0.0, 0.0),
                 ],
             },
-            Face::Z_MINUS => Quad {
+            Face::ZMinus => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], 1.0, 1.0),
                     Vertex::new([0.0, 1.0, 0.0], [0.0, 0.0, -1.0], 1.0, 0.0),
@@ -35,7 +35,7 @@ impl Quad {
                     Vertex::new([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], 0.0, 1.0),
                 ],
             },
-            Face::X_PLUS => Quad {
+            Face::XPlus => Quad {
                 vertices: [
                     Vertex::new([1.0, 0.0, 0.0], [1.0, 0.0, 0.0], 1.0, 1.0),
                     Vertex::new([1.0, 1.0, 0.0], [1.0, 0.0, 0.0], 1.0, 0.0),
@@ -43,7 +43,7 @@ impl Quad {
                     Vertex::new([1.0, 0.0, 1.0], [1.0, 0.0, 0.0], 0.0, 1.0),
                 ],
             },
-            Face::X_MINUS => Quad {
+            Face::XMinus => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 0.0], [-1.0, 0.0, 0.0], 0.0, 1.0),
                     Vertex::new([0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], 1.0, 1.0),
@@ -51,7 +51,7 @@ impl Quad {
                     Vertex::new([0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], 0.0, 0.0),
                 ],
             },
-            Face::Y_PLUS => Quad {
+            Face::YPlus => Quad {
                 vertices: [
                     Vertex::new([0.0, 1.0, 1.0], [0.0, 1.0, 0.0], 1.0, 0.0),
                     Vertex::new([1.0, 1.0, 1.0], [0.0, 1.0, 0.0], 0.0, 0.0),
@@ -59,7 +59,7 @@ impl Quad {
                     Vertex::new([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], 1.0, 1.0),
                 ],
             },
-            Face::Y_MINUS => Quad {
+            Face::YMinus => Quad {
                 vertices: [
                     Vertex::new([0.0, 0.0, 1.0], [0.0, -1.0, 0.0], 1.0, 0.0),
                     Vertex::new([0.0, 0.0, 0.0], [0.0, -1.0, 0.0], 1.0, 1.0),
@@ -80,7 +80,7 @@ impl Quad {
         let mut vertices = Vec::new();
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Face::X_PLUS,
+                Face::XPlus,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -91,7 +91,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Face::X_MINUS,
+                Face::XMinus,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -102,7 +102,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Face::Z_PLUS,
+                Face::ZPlus,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -113,7 +113,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Face::Z_MINUS,
+                Face::ZMinus,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -124,7 +124,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Face::Y_PLUS,
+                Face::YPlus,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,
@@ -135,7 +135,7 @@ impl Quad {
         );
         vertices.extend_from_slice(
             &Quad::get_quad(
-                Face::Y_MINUS,
+                Face::YMinus,
                 Vec3 {
                     x: 0.0,
                     y: 0.0,

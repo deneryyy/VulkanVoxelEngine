@@ -1,24 +1,44 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
+use crossbeam_channel::{Receiver, Sender, bounded};
 use glam::{IVec3, Vec3};
 use noise::{
-    Fbm, NoiseFn, Perlin, core::perlin::perlin_3d, permutationtable::PermutationTable,
-    utils::PlaneMapBuilder,
+    Fbm, MultiFractal, NoiseFn, Perlin, core::perlin::perlin_3d,
+    permutationtable::PermutationTable, utils::PlaneMapBuilder,
+};
+use parking_lot::RwLock;
+use rayon::{
+    ThreadPool, ThreadPoolBuilder,
+    iter::{IntoParallelIterator, ParallelIterator},
 };
 
 use crate::app::{
-    engine::renderer::{
-        quad::{Face, Quad},
-        vertex::Vertex,
+    engine::{
+        input::InputManager,
+        renderer::{
+            camera::Camera,
+            quad::{Face, Quad},
+            vertex::Vertex,
+        },
     },
     game::{
         block::BlockType,
+        player::Player,
         registry::{self},
     },
 };
 
 pub struct World {
-    chunks: HashMap<IVec3, Chunk>,
+    seed: u32,
+    fbm_perlin: Fbm<Perlin>,
+    thread_pool: ThreadPool,
+    sender: Sender<ChunkMessage>,
+    receiver: Receiver<ChunkMessage>,
+    chunks: RwLock<HashMap<IVec3, Chunk>>,
+    pub player: RwLock<Player>,
 }
 
 pub struct Chunk {
@@ -31,56 +51,156 @@ pub struct ChunkMesh {
     pub chunk_pos: IVec3,
 }
 
+pub enum ChunkMessage {
+    Load((IVec3, Vec<ChunkMesh>)),
+    Unload(IVec3),
+}
+
 impl World {
-    pub fn new() -> Self {
+    pub fn new(seed: u32, input_manager: Arc<InputManager>) -> Self {
+        let (sender, receiver) = bounded(8);
         Self {
-            chunks: HashMap::new(),
+            seed,
+            fbm_perlin: Fbm::<Perlin>::new(seed)
+                .set_octaves(4)
+                .set_frequency(0.02)
+                .set_lacunarity(2.0)
+                .set_persistence(0.5),
+            thread_pool: ThreadPoolBuilder::new().num_threads(8).build().unwrap(),
+            sender,
+            receiver,
+            chunks: RwLock::new(HashMap::new()),
+            player: RwLock::new(Player::new(
+                input_manager.clone(),
+                Vec3 {
+                    x: 2.0,
+                    y: 2.0,
+                    z: 2.0,
+                },
+                Camera::new(
+                    Vec3 {
+                        x: 2.0,
+                        y: 2.0,
+                        z: 2.0,
+                    },
+                    Vec3 {
+                        x: 0.0,
+                        y: 1.0,
+                        z: 0.0,
+                    },
+                    225.0,
+                    -37.0,
+                    0.0,
+                ),
+                16
+            )),
         }
     }
 
-    pub fn generate(&mut self) {
-        let perlin = Perlin::new(1);
-        for i in -2..2 as i32 {
-            for j in -2..2 as i32 {
-                let mut chunk = Chunk {
-                    block_ids: [0; 16 * 16 * 16],
-                };
-                for x in 0..16 {
-                    for z in 0..16 {
-                        let point = (perlin.get([x as f64 / 32.0, z as f64 / 32.0]) * 16.0) as u32;
-
-                        chunk.write_block_id(x, point, z, 1);
-                    }
+    pub fn tick(&self, delta_time: f32) {
+        let player_position;
+        let render_distance;
+        {
+            let player = self.player.read();
+            player_position = player.position;
+            render_distance = player.render_distance;
+        }
+        let chunk_positions = Self::get_chunk_positions_square(player_position, render_distance as i32);
+        let mut to_load = Vec::new();
+        let mut to_unload = Vec::new();
+        {
+            let mut chunks = self.chunks.write();
+            for chunk_position in chunk_positions.clone() {
+                if !chunks.contains_key(&chunk_position) {
+                    to_load.push(chunk_position);
                 }
-                self.chunks.insert(IVec3 { x: i, y: 0, z: j }, chunk);
+            }
+            for chunk_position in chunks.keys() {
+                if !chunk_positions.contains(chunk_position) {
+                    to_unload.push(chunk_position.clone());
+                }
+            }
+            for chunk_position in to_load.clone() {
+                let chunk = self.generate_chunk(chunk_position);
+                chunks.insert(chunk_position, chunk);
             }
         }
+        for chunk_position in to_unload {
+            self.sender
+                .send(ChunkMessage::Unload(chunk_position))
+                .unwrap();
+            let mut chunks = self.chunks.write();
+            chunks.remove(&chunk_position);
+        }
+        for chunk_position in to_load {
+            let chunks = self.chunks.read();
+            let chunk = chunks.get(&chunk_position).unwrap();
+            self.sender
+                .send(ChunkMessage::Load((
+                    chunk_position,
+                    self.get_chunk_meshes(chunk, &chunk_position),
+                )))
+                .unwrap();
+        }
+    }
+
+    pub fn get_receiver(&self) -> Receiver<ChunkMessage> {
+        self.receiver.clone()
+    }
+
+    fn world_to_chunk_pos(world_x: f32, world_z: f32) -> (i32, i32) {
+        let chunk_x = (world_x / 16 as f32).floor() as i32;
+        let chunk_z = (world_z / 16 as f32).floor() as i32;
+        (chunk_x, chunk_z)
+    }
+
+    fn get_chunk_positions_square(player_pos: Vec3, render_distance_chunks: i32) -> Vec<IVec3> {
+        let (chunk_x, chunk_z) = Self::world_to_chunk_pos(player_pos.x, player_pos.z);
+        let mut chunks = Vec::new();
+
+        let min_x = chunk_x - render_distance_chunks;
+        let max_x = chunk_x + render_distance_chunks;
+        let min_z = chunk_z - render_distance_chunks;
+        let max_z = chunk_z + render_distance_chunks;
+
+        for x in min_x..=max_x {
+            for z in min_z..=max_z {
+                chunks.push(IVec3 { x, y: 0, z });
+            }
+        }
+
+        chunks
+    }
+
+    pub fn generate_chunk(&self, pos: IVec3) -> Chunk {
+        let mut chunk = Chunk {
+            block_ids: [0; 16 * 16 * 16],
+        };
+
+        for lx in 0..16 {
+            for lz in 0..16 {
+                let world_x = (pos.x * 16) + lx as i32;
+                let world_z = (pos.z * 16) + lz as i32;
+                let point = (self.fbm_perlin.get([world_x as f64, world_z as f64]) * 12.0) as u32;
+
+                chunk.write_block_id(lx, point, lz, 1);
+            }
+        }
+        chunk
     }
 
     pub fn get_block_id(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         let chunk_x = x.rem_euclid(16) as usize;
         let chunk_y = y.rem_euclid(16) as usize;
         let chunk_z = z.rem_euclid(16) as usize;
-        self.get_chunk(IVec3 {
-            x: x.div_euclid(16),
-            y: y.div_euclid(16),
-            z: z.div_euclid(16),
-        })
-        .map(|chunk| chunk.get_block_id(chunk_x, chunk_y, chunk_z))
-    }
-
-    pub fn get_chunk(&self, pos: IVec3) -> Option<&Chunk> {
-        self.chunks.get(&pos)
-    }
-
-    pub fn get_world_meshes(&self) -> Vec<ChunkMesh> {
-        let chunk_meshes = self
-            .chunks
-            .iter()
-            .flat_map(|chunk| self.get_chunk_meshes(chunk.1, chunk.0))
-            .collect::<Vec<_>>();
-
-        chunk_meshes
+        let chunks = self.chunks.read();
+        chunks
+            .get(&IVec3 {
+                x: x.div_euclid(16),
+                y: y.div_euclid(16),
+                z: z.div_euclid(16),
+            })
+            .map(|chunk| chunk.get_block_id(chunk_x, chunk_y, chunk_z))
     }
 
     fn should_render_face(&self, neighbor: &BlockType) -> bool {
@@ -141,7 +261,7 @@ impl World {
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
-                Face::X_PLUS,
+                Face::XPlus,
                 x,
                 y,
                 z,
@@ -152,7 +272,7 @@ impl World {
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
-                Face::X_MINUS,
+                Face::XMinus,
                 x,
                 y,
                 z,
@@ -163,7 +283,7 @@ impl World {
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
-                Face::Y_PLUS,
+                Face::YPlus,
                 x,
                 y,
                 z,
@@ -174,7 +294,7 @@ impl World {
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
-                Face::Y_MINUS,
+                Face::YMinus,
                 x,
                 y,
                 z,
@@ -185,7 +305,7 @@ impl World {
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
-                Face::Z_PLUS,
+                Face::ZPlus,
                 x,
                 y,
                 z,
@@ -196,7 +316,7 @@ impl World {
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
-                Face::Z_MINUS,
+                Face::ZMinus,
                 x,
                 y,
                 z,

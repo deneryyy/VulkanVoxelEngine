@@ -1,26 +1,33 @@
+pub mod input;
 pub mod renderer;
 pub mod resources;
 
 use std::{
     sync::{Arc, Mutex},
     thread,
+    time::Instant,
 };
 
 use anyhow::{Ok, Result};
 use winit::{
-    event::{DeviceEvent, KeyEvent, WindowEvent},
+    event::{DeviceEvent, ElementState, KeyEvent, WindowEvent},
     event_loop::ActiveEventLoop,
     keyboard::PhysicalKey,
-    window::{Window},
+    window::Window,
 };
 
 use crate::app::{
-    engine::renderer::{Renderer, context::RenderingContext},
+    engine::{
+        input::InputManager,
+        renderer::{Renderer, context::RenderingContext},
+    },
     game::{Game, world::World},
 };
 
 pub struct Engine {
-    world: Arc<Mutex<World>>,
+    last_frame: Instant,
+    world: Arc<World>,
+    input_manager: Arc<InputManager>,
     renderer: Renderer,
     window: Arc<Window>,
     context: Arc<RenderingContext>,
@@ -28,7 +35,8 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
-        let world = Arc::new(Mutex::new(World::new()));
+        let input_manager = Arc::new(InputManager::new());
+        let world = Arc::new(World::new(42, input_manager.clone()));
         let world_ = world.clone();
         thread::spawn(move || {
             let mut game = Game::new(world_);
@@ -41,7 +49,9 @@ impl Engine {
         let context = Arc::new(RenderingContext::new(window.clone())?);
         let renderer = Renderer::new(context.clone(), window.clone(), world.clone())?;
         Ok(Self {
+            last_frame: Instant::now(),
             world,
+            input_manager,
             renderer,
             window,
             context,
@@ -56,13 +66,21 @@ impl Engine {
     ) {
         match event {
             DeviceEvent::MouseMotion { delta } => {
-                self.renderer
-                    .process_camera_rotation(delta.0 as f32, delta.1 as f32);
+                self.world
+                    .player
+                    .write()
+                    .camera
+                    .process_mouse_movement(delta.0 as f32, delta.1 as f32);
             }
             DeviceEvent::Key(event) => match event.physical_key {
-                PhysicalKey::Code(code) => {
-                    self.renderer.process_camera_input(code, event.state);
-                }
+                PhysicalKey::Code(code) => match event.state {
+                    ElementState::Pressed => {
+                        self.input_manager.pressed_keys.write().insert(code);
+                    }
+                    ElementState::Released => {
+                        self.input_manager.pressed_keys.write().remove(&code);
+                    }
+                },
                 _ => {}
             },
             _ => {}
@@ -86,6 +104,13 @@ impl Engine {
                 self.renderer.resize().unwrap();
             }
             WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                let delta_time = now.duration_since(self.last_frame).as_secs_f32();
+                self.last_frame = now;
+                {
+                    let mut player = self.world.player.write();
+                    player.tick(delta_time);
+                }
                 self.renderer.render().unwrap();
             }
             WindowEvent::KeyboardInput {
