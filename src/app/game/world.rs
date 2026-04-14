@@ -58,7 +58,7 @@ pub enum ChunkMessage {
 
 impl World {
     pub fn new(seed: u32, input_manager: Arc<InputManager>) -> Self {
-        let (sender, receiver) = bounded(8);
+        let (sender, receiver) = bounded(64);
         Self {
             seed,
             fbm_perlin: Fbm::<Perlin>::new(seed)
@@ -74,13 +74,13 @@ impl World {
                 input_manager.clone(),
                 Vec3 {
                     x: 2.0,
-                    y: 2.0,
+                    y: 200.0,
                     z: 2.0,
                 },
                 Camera::new(
                     Vec3 {
                         x: 2.0,
-                        y: 2.0,
+                        y: 200.0,
                         z: 2.0,
                     },
                     Vec3 {
