@@ -17,17 +17,11 @@ layout(buffer_reference, std430) readonly buffer VertexBuffer {
 	Vertex vertices[];
 };
 
-layout(buffer_reference, std430) readonly buffer MatrixBuffer { 
-	Matrix matrices[];
-};
-
 //push constants block
 layout( push_constant ) uniform constants
 {	
 	VertexBuffer vertexBuffer;
-	MatrixBuffer matrixBuffer;
 	uint materialId;
-	uint renderObjectId;
 } PushConstants;
 
 layout(set = 0, binding = 0) uniform UniformBufferObject {
@@ -43,7 +37,7 @@ void main() {
     Vertex v = PushConstants.vertexBuffer.vertices[gl_VertexIndex];
 
 	//output data
-	gl_Position =  ubo.proj * ubo.view * PushConstants.matrixBuffer.matrices[PushConstants.renderObjectId].model * vec4(v.position, 1.0F);
+	gl_Position =  ubo.proj * ubo.view  * vec4(v.position, 1.0F);
 	fragTexCoord = vec2(v.uv1, v.uv2);
 	materialId = PushConstants.materialId;
 }

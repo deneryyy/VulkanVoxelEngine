@@ -3,6 +3,7 @@ pub mod context;
 pub mod descriptor;
 pub mod model;
 pub mod quad;
+pub mod staging;
 pub mod swapchain;
 pub mod texture;
 pub mod vertex;
@@ -24,6 +25,7 @@ use crate::app::{
         renderer::{
             context::{AllocatedBuffer, RenderingContext},
             descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
+            staging::RingStagingBuffer,
             swapchain::Swapchain,
             texture::Texture,
             vertex::Vertex,
@@ -47,9 +49,7 @@ pub struct Frame {
 #[repr(C, align(16))]
 struct GPUDrawPushConstants {
     vertex_buffer: vk::DeviceAddress,
-    matrix_buffer: vk::DeviceAddress,
     material_id: u32,
-    render_object_id: u32,
 }
 
 struct UniformBufferObject {
@@ -72,8 +72,7 @@ struct Matrix {
 
 pub struct Renderer {
     ring_staging_buffer: RingStagingBuffer,
-    matrix_buffer_address: vk::DeviceAddress,
-    matrix_buffer: AllocatedBuffer,
+    chunk_message_queue: VecDeque<ChunkMessage>,
     loaded_chunk_meshes: HashMap<IVec3, Vec<AllocatedChunkMesh>>,
     chunk_mesh_pool: VecDeque<AllocatedChunkMesh>,
     allocator: Allocator,
@@ -89,153 +88,7 @@ pub struct Renderer {
     context: Arc<RenderingContext>,
 }
 
-pub struct RingStagingBuffer {
-    buffer: AllocatedBuffer,
-    size: u64,
-    head: u64,
-    frame_allocations: Vec<Vec<RingStagingBufferAllocation>>,
-}
-
-#[derive(Clone, Copy)]
-pub struct RingStagingBufferAllocation {
-    size: u64,
-    offset: u64,
-}
-
-const FRAME_OVERLAP: usize = 2;
-
-impl RingStagingBuffer {
-    pub fn new(
-        context: Arc<RenderingContext>,
-        allocator: &mut Allocator,
-        size: u64,
-    ) -> Result<Self> {
-        let buffer = context.create_buffer(
-            allocator,
-            size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        )?;
-        Ok(Self {
-            buffer,
-            size,
-            head: 0,
-            frame_allocations: (0..FRAME_OVERLAP).map(|_| Vec::new()).collect(),
-        })
-    }
-
-    pub fn push<T>(
-        &mut self,
-        data: &[T],
-        frame_index: usize,
-    ) -> Result<RingStagingBufferAllocation> {
-        let size = (std::mem::size_of::<T>() * data.len()) as u64;
-        let alignment = std::mem::align_of::<T>() as u64;
-
-        let mut offset = (self.head + alignment - 1) & !(alignment - 1);
-
-        let wraps = offset + size > self.size;
-
-        if wraps {
-            offset = 0;
-        }
-
-        for (index, allocations) in self.frame_allocations.iter().enumerate() {
-            if index != frame_index {
-                for existing in allocations {
-                    let overlap =
-                        offset < existing.offset + existing.size && offset + size > existing.offset;
-                    if overlap {
-                        return Err(anyhow!(
-                            "Buffer full: would overwrite frame {} alloc at offset {}-{}",
-                            index,
-                            existing.offset,
-                            existing.offset + existing.size
-                        ));
-                    }
-                }
-            }
-        }
-
-        for existing in &self.frame_allocations[frame_index] {
-            let overlap =
-                offset < existing.offset + existing.size && offset + size > existing.offset;
-            if overlap {
-                return Err(anyhow!("Overlap with same frame's existing allocation"));
-            }
-        }
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.buffer
-                    .allocation
-                    .mapped_ptr()
-                    .unwrap()
-                    .as_ptr()
-                    .byte_add(offset as usize)
-                    .cast(),
-                data.len(),
-            );
-        }
-
-        let allocation = RingStagingBufferAllocation { size, offset };
-        self.frame_allocations[frame_index].push(allocation.clone());
-
-        if wraps {
-            self.head = size;
-        } else {
-            self.head = offset + size;
-        }
-
-        if self.head >= self.size {
-            self.head = 0;
-        }
-
-        Ok(allocation)
-    }
-
-    pub fn transfer(
-        &mut self,
-        context: Arc<RenderingContext>,
-        cmd: vk::CommandBuffer,
-        allocation: RingStagingBufferAllocation,
-        dst_buf: &AllocatedBuffer,
-        dst_stage_mask: vk::PipelineStageFlags2,
-        dst_access_mask: vk::AccessFlags2,
-    ) {
-        unsafe {
-            context.device.cmd_copy_buffer(
-                cmd,
-                self.buffer.buffer,
-                dst_buf.buffer,
-                &[vk::BufferCopy::default()
-                    .dst_offset(0)
-                    .src_offset(allocation.offset)
-                    .size(allocation.size)],
-            );
-            context.device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&[
-                    vk::BufferMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(dst_stage_mask)
-                        .dst_access_mask(dst_access_mask)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(dst_buf.buffer)
-                        .size(dst_buf.allocation.size()),
-                ]),
-            );
-        }
-    }
-
-    pub fn retire_frame(&mut self, frame_index: usize) -> Result<()> {
-        self.frame_allocations[frame_index].clear();
-        Ok(())
-    }
-}
+pub const FRAME_OVERLAP: usize = 2;
 
 impl Renderer {
     pub fn new(
@@ -301,6 +154,7 @@ impl Renderer {
                 let vertex_buffer_size = (16 * 16 * 16 * std::mem::size_of::<Vertex>()) as u64;
 
                 let vertex_buffer = context.create_buffer(
+                    "Vertex buffer",
                     &mut allocator,
                     vertex_buffer_size,
                     vk::BufferUsageFlags::STORAGE_BUFFER
@@ -311,6 +165,7 @@ impl Renderer {
 
                 let index_buffer_size = (6 * 16 * 16 * 16 * 3 * std::mem::size_of::<u32>()) as u64;
                 let index_buffer = context.create_buffer(
+                    "Index buffer",
                     &mut allocator,
                     index_buffer_size,
                     vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -329,22 +184,6 @@ impl Renderer {
                     vertex_buffer_address,
                 });
             }
-
-            let matrix_buffer_size = (render_distance as usize
-                * render_distance as usize
-                * 6
-                * std::mem::size_of::<Matrix>()) as u64;
-            let matrix_buffer = context.create_buffer(
-                &mut allocator,
-                matrix_buffer_size,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                gpu_allocator::MemoryLocation::GpuOnly,
-            )?;
-            let matrix_buffer_address = context.device.get_buffer_device_address(
-                &vk::BufferDeviceAddressInfo::default().buffer(matrix_buffer.buffer),
-            );
 
             let mut frames: Vec<Frame> = Vec::with_capacity(FRAME_OVERLAP);
             for _ in 0..FRAME_OVERLAP {
@@ -375,6 +214,7 @@ impl Renderer {
                     .unwrap();
 
                 let uniform_buffer = context.create_buffer(
+                    "Uniform buffer",
                     &mut allocator,
                     std::mem::size_of::<UniformBufferObject>() as u64,
                     vk::BufferUsageFlags::UNIFORM_BUFFER,
@@ -482,8 +322,7 @@ impl Renderer {
             context.device.destroy_shader_module(fragment_shader, None);
 
             Ok(Self {
-                matrix_buffer,
-                matrix_buffer_address,
+                chunk_message_queue: VecDeque::new(),
                 chunk_mesh_pool,
                 loaded_chunk_meshes: HashMap::new(),
                 ring_staging_buffer: RingStagingBuffer::new(
@@ -536,36 +375,6 @@ impl Renderer {
         }
     }
 
-    fn upload_matrix_buffer(
-        loaded_chunk_meshes: &HashMap<IVec3, Vec<AllocatedChunkMesh>>,
-        ring_staging_buffer: &mut RingStagingBuffer,
-        context: Arc<RenderingContext>,
-        matrix_buffer: &AllocatedBuffer,
-        frame: &Frame,
-        frame_index: usize,
-    ) -> Result<()> {
-        let matrices = loaded_chunk_meshes
-            .iter()
-            .map(|allocated_chunk_meshes| Matrix {
-                model: glam::Mat4::from_translation(Vec3 {
-                    x: (allocated_chunk_meshes.0.x * 16) as f32,
-                    y: (allocated_chunk_meshes.0.y * 16) as f32,
-                    z: (allocated_chunk_meshes.0.z * 16) as f32,
-                }),
-            })
-            .collect::<Vec<_>>();
-        let matrix_alloc = ring_staging_buffer.push(&matrices, frame_index)?;
-        ring_staging_buffer.transfer(
-            context.clone(),
-            frame.command_buffer,
-            matrix_alloc,
-            matrix_buffer,
-            vk::PipelineStageFlags2::VERTEX_SHADER,
-            vk::AccessFlags2::SHADER_READ,
-        );
-        Ok(())
-    }
-
     pub fn render(&mut self) -> Result<()> {
         unsafe {
             let frame_index = self.frame_number % FRAME_OVERLAP;
@@ -607,23 +416,44 @@ impl Renderer {
             Self::upload_uniform_buffer(self.world.clone(), &self.swapchain, frame);
 
             while let stdOk(chunk_message) = self.world.get_receiver().try_recv() {
-                match chunk_message {
+                self.chunk_message_queue.push_back(chunk_message);
+            }
+
+            'outer: while !self.chunk_message_queue.is_empty() {
+                let chunk_message = self.chunk_message_queue.pop_front().unwrap();
+                match &chunk_message {
                     ChunkMessage::Load(chunk_meshes) => {
                         let mut loaded_chunks = HashMap::new();
-                        for chunk_mesh in chunk_meshes.1 {
+                        for chunk_mesh in &chunk_meshes.1 {
                             if let Some(mut allocated_chunk_mesh) = self.chunk_mesh_pool.pop_front()
                             {
-                                let verts = chunk_mesh.vertices;
+                                let verts = &chunk_mesh.vertices;
                                 let indices = Vertex::generate_indices(verts.len());
                                 let vert_allocation =
-                                    self.ring_staging_buffer.push(&verts, frame_index)?;
+                                    self.ring_staging_buffer.push(&verts, frame_index);
                                 let index_allocation =
-                                    self.ring_staging_buffer.push(&indices, frame_index)?;
+                                    self.ring_staging_buffer.push(&indices, frame_index);
+
+                                if vert_allocation.is_err() || index_allocation.is_err() {
+                                    self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
+                                    self.chunk_message_queue.push_back(chunk_message);
+                                    for loaded_chunk in loaded_chunks {
+                                        if let Some(old_meshes) = self
+                                            .loaded_chunk_meshes
+                                            .insert(loaded_chunk.0, loaded_chunk.1)
+                                        {
+                                            for mesh in old_meshes {
+                                                self.chunk_mesh_pool.push_back(mesh);
+                                            }
+                                        }
+                                    }
+                                    break 'outer;
+                                }
 
                                 self.ring_staging_buffer.transfer(
                                     self.context.clone(),
                                     frame.command_buffer,
-                                    vert_allocation,
+                                    vert_allocation?,
                                     &allocated_chunk_mesh.vertex_buffer,
                                     vk::PipelineStageFlags2::VERTEX_SHADER,
                                     vk::AccessFlags2::SHADER_READ,
@@ -631,7 +461,7 @@ impl Renderer {
                                 self.ring_staging_buffer.transfer(
                                     self.context.clone(),
                                     frame.command_buffer,
-                                    index_allocation,
+                                    index_allocation?,
                                     &allocated_chunk_mesh.index_buffer,
                                     vk::PipelineStageFlags2::VERTEX_SHADER,
                                     vk::AccessFlags2::SHADER_READ,
@@ -654,28 +484,12 @@ impl Renderer {
                                 }
                             }
                         }
-                        Self::upload_matrix_buffer(
-                            &self.loaded_chunk_meshes,
-                            &mut self.ring_staging_buffer,
-                            self.context.clone(),
-                            &self.matrix_buffer,
-                            frame,
-                            frame_index,
-                        )?;
                     }
                     ChunkMessage::Unload(pos) => match self.loaded_chunk_meshes.remove(&pos) {
                         Some(allocated_chunk_meshes) => {
                             for allocated_chunk_mesh in allocated_chunk_meshes {
                                 self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
                             }
-                            Self::upload_matrix_buffer(
-                                &self.loaded_chunk_meshes,
-                                &mut self.ring_staging_buffer,
-                                self.context.clone(),
-                                &self.matrix_buffer,
-                                frame,
-                                frame_index,
-                            )?;
                         }
                         None => {}
                     },
@@ -734,13 +548,20 @@ impl Renderer {
                 self.pipeline,
             );
 
-            for (i, render_objs) in self.loaded_chunk_meshes.iter().enumerate() {
-                for render_object in render_objs.1 {
+            self.context.device.cmd_bind_descriptor_sets(
+                frame.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[frame.descriptors],
+                &[],
+            );
+
+            for (offset, allocated_meshes) in self.loaded_chunk_meshes.iter() {
+                for allocated_mesh in allocated_meshes {
                     let push_constants = GPUDrawPushConstants {
-                        vertex_buffer: render_object.vertex_buffer_address,
-                        matrix_buffer: self.matrix_buffer_address,
-                        material_id: render_object.material,
-                        render_object_id: i as u32,
+                        vertex_buffer: allocated_mesh.vertex_buffer_address,
+                        material_id: allocated_mesh.material,
                     };
                     self.context.device.cmd_push_constants(
                         frame.command_buffer,
@@ -752,27 +573,19 @@ impl Renderer {
                             std::mem::size_of::<GPUDrawPushConstants>(),
                         ),
                     );
+
                     self.context.device.cmd_bind_index_buffer(
                         frame.command_buffer,
-                        render_object.index_buffer.buffer,
+                        allocated_mesh.index_buffer.buffer,
                         0,
                         vk::IndexType::UINT32,
                     );
 
-                    self.context.device.cmd_bind_descriptor_sets(
-                        frame.command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipeline_layout,
-                        0,
-                        &[frame.descriptors],
-                        &[],
-                    );
-
                     self.context.device.cmd_draw_indexed(
                         frame.command_buffer,
-                        render_object.index_count,
+                        allocated_mesh.index_count,
                         1,
-                        render_object.first_index,
+                        allocated_mesh.first_index,
                         0,
                         0,
                     );
@@ -899,8 +712,6 @@ impl Drop for Renderer {
                 self.context
                     .destroy_buffer(&mut self.allocator, &mut loaded_chunk_mesh.index_buffer);
             }
-            self.context
-                .destroy_buffer(&mut self.allocator, &mut self.matrix_buffer);
             self.context
                 .destroy_buffer(&mut self.allocator, &mut self.ring_staging_buffer.buffer);
             for texture in &mut self.textures {

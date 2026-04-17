@@ -66,7 +66,7 @@ impl World {
                 .set_frequency(0.02)
                 .set_lacunarity(2.0)
                 .set_persistence(0.5),
-            thread_pool: ThreadPoolBuilder::new().num_threads(8).build().unwrap(),
+            thread_pool: ThreadPoolBuilder::new().num_threads(16).build().unwrap(),
             sender,
             receiver,
             chunks: RwLock::new(HashMap::new()),
@@ -92,7 +92,7 @@ impl World {
                     -37.0,
                     0.0,
                 ),
-                16
+                32,
             )),
         }
     }
@@ -105,43 +105,47 @@ impl World {
             player_position = player.position;
             render_distance = player.render_distance;
         }
-        let chunk_positions = Self::get_chunk_positions_square(player_position, render_distance as i32);
+        let chunk_positions =
+            Self::get_chunk_positions_square(player_position, render_distance as i32);
         let mut to_load = Vec::new();
         let mut to_unload = Vec::new();
-        {
-            let mut chunks = self.chunks.write();
-            for chunk_position in chunk_positions.clone() {
-                if !chunks.contains_key(&chunk_position) {
-                    to_load.push(chunk_position);
+        self.thread_pool.install(|| {
+            {
+                let chunks = self.chunks.read();
+                for chunk_position in chunk_positions.clone() {
+                    if !chunks.contains_key(&chunk_position) {
+                        to_load.push(chunk_position);
+                    }
+                }
+                for chunk_position in chunks.keys() {
+                    if !chunk_positions.contains(chunk_position) {
+                        to_unload.push(chunk_position.clone());
+                    }
                 }
             }
-            for chunk_position in chunks.keys() {
-                if !chunk_positions.contains(chunk_position) {
-                    to_unload.push(chunk_position.clone());
-                }
-            }
-            for chunk_position in to_load.clone() {
+            to_load.clone().into_par_iter().for_each(|chunk_position| {
+                let mut chunks = self.chunks.write();
                 let chunk = self.generate_chunk(chunk_position);
                 chunks.insert(chunk_position, chunk);
+            });
+            for chunk_position in to_unload {
+                self.sender
+                    .send(ChunkMessage::Unload(chunk_position))
+                    .unwrap();
+                let mut chunks = self.chunks.write();
+                chunks.remove(&chunk_position);
             }
-        }
-        for chunk_position in to_unload {
-            self.sender
-                .send(ChunkMessage::Unload(chunk_position))
-                .unwrap();
-            let mut chunks = self.chunks.write();
-            chunks.remove(&chunk_position);
-        }
-        for chunk_position in to_load {
-            let chunks = self.chunks.read();
-            let chunk = chunks.get(&chunk_position).unwrap();
-            self.sender
-                .send(ChunkMessage::Load((
-                    chunk_position,
-                    self.get_chunk_meshes(chunk, &chunk_position),
-                )))
-                .unwrap();
-        }
+            to_load.into_par_iter().for_each(|chunk_position| {
+                let chunks = self.chunks.read();
+                let chunk = chunks.get(&chunk_position).unwrap();
+                self.sender
+                    .send(ChunkMessage::Load((
+                        chunk_position,
+                        self.get_chunk_meshes(chunk, &chunk_position),
+                    )))
+                    .unwrap();
+            });
+        });
     }
 
     pub fn get_receiver(&self) -> Receiver<ChunkMessage> {
@@ -212,9 +216,9 @@ impl World {
         block_type: &BlockType,
         vertices_per_material: &mut HashMap<u32, Vec<Vertex>>,
         face: Face,
-        x: u32,
-        y: u32,
-        z: u32,
+        x: i32,
+        y: i32,
+        z: i32,
         xn: i32,
         yn: i32,
         zn: i32,
@@ -262,9 +266,9 @@ impl World {
                 block_type,
                 &mut vertices_per_material,
                 Face::XPlus,
-                x,
-                y,
-                z,
+                xn,
+                yn,
+                zn,
                 xn + 1,
                 yn,
                 zn,
@@ -273,9 +277,9 @@ impl World {
                 block_type,
                 &mut vertices_per_material,
                 Face::XMinus,
-                x,
-                y,
-                z,
+                xn,
+                yn,
+                zn,
                 xn - 1,
                 yn,
                 zn,
@@ -284,9 +288,9 @@ impl World {
                 block_type,
                 &mut vertices_per_material,
                 Face::YPlus,
-                x,
-                y,
-                z,
+                xn,
+                yn,
+                zn,
                 xn,
                 yn + 1,
                 zn,
@@ -295,9 +299,9 @@ impl World {
                 block_type,
                 &mut vertices_per_material,
                 Face::YMinus,
-                x,
-                y,
-                z,
+                xn,
+                yn,
+                zn,
                 xn,
                 yn - 1,
                 zn,
@@ -306,9 +310,9 @@ impl World {
                 block_type,
                 &mut vertices_per_material,
                 Face::ZPlus,
-                x,
-                y,
-                z,
+                xn,
+                yn,
+                zn,
                 xn,
                 yn,
                 zn + 1,
@@ -317,9 +321,9 @@ impl World {
                 block_type,
                 &mut vertices_per_material,
                 Face::ZMinus,
-                x,
-                y,
-                z,
+                xn,
+                yn,
+                zn,
                 xn,
                 yn,
                 zn - 1,

@@ -34,6 +34,7 @@ impl Texture {
             .decode()?;
         let buffer = img.to_rgba8();
         let mut staging = context.create_buffer(
+            "Texture staging buffer",
             allocator,
             (buffer.len() * std::mem::size_of::<Rgba<f32>>()) as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,

@@ -622,6 +622,7 @@ impl RenderingContext {
 
     pub fn create_buffer(
         &self,
+        name: &str,
         allocator: &mut Allocator,
         alloc_size: u64,
         usage: vk::BufferUsageFlags,
@@ -634,7 +635,7 @@ impl RenderingContext {
             )?;
             let requirements = self.device.get_buffer_memory_requirements(buffer);
             let allocation = allocator.allocate(&AllocationCreateDesc {
-                name: "Buffer",
+                name: name,
                 requirements,
                 location,
                 linear: true,
