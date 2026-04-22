@@ -5,40 +5,37 @@ pub mod model;
 pub mod quad;
 pub mod staging;
 pub mod swapchain;
+pub mod terrain;
 pub mod texture;
 pub mod vertex;
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    u32,
-};
+use std::{sync::Arc, u32};
 
-use anyhow::{Ok, Result, anyhow};
-use glam::{IVec3, Mat4, Vec3};
+use anyhow::{Ok, Result};
+use glam::{Mat4, Vec4};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
-use std::result::Result::Ok as stdOk;
+use parking_lot::Mutex;
 use winit::window::Window;
 
 use crate::app::{
-    engine::{
-        renderer::{
-            context::{AllocatedBuffer, RenderingContext},
-            descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
-            staging::RingStagingBuffer,
-            swapchain::Swapchain,
-            texture::Texture,
-            vertex::Vertex,
-        },
-        resources,
+    engine::renderer::{
+        context::{AllocatedBuffer, RenderingContext},
+        descriptor::{DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
+        staging::RingStagingBuffer,
+        swapchain::Swapchain,
+        terrain::TerrainRenderer,
+        texture::Texture,
     },
-    game::world::{ChunkMessage, World},
+    game::world::World,
 };
 use ash::vk::{self, CommandBufferUsageFlags};
 
 pub struct Frame {
-    descriptors: vk::DescriptorSet,
-    descriptor_layout: vk::DescriptorSetLayout,
+    ray_traversal_descriptors: vk::DescriptorSet,
+    ray_traversal_descriptor_layout: vk::DescriptorSetLayout,
+    ray_traversal_uniform_buffer: AllocatedBuffer,
+    vertex_terrain_descriptors: vk::DescriptorSet,
+    vertex_terrain_descriptor_layout: vk::DescriptorSetLayout,
     uniform_buffer: AllocatedBuffer,
     in_flight_fence: vk::Fence,
     image_available_semaphore: vk::Semaphore,
@@ -46,40 +43,25 @@ pub struct Frame {
     command_pool: vk::CommandPool,
 }
 
-#[repr(C, align(16))]
-struct GPUDrawPushConstants {
-    vertex_buffer: vk::DeviceAddress,
-    material_id: u32,
+#[repr(C)]
+struct RayTraversalUBO {
+    inv_view: glam::Mat4,
+    inv_proj: glam::Mat4,
+    camera_pos: glam::Vec4,
 }
 
+#[repr(C)]
 struct UniformBufferObject {
     view: glam::Mat4,
     proj: glam::Mat4,
 }
 
-pub struct AllocatedChunkMesh {
-    index_count: u32,
-    first_index: u32,
-    material: u32,
-    index_buffer: AllocatedBuffer,
-    vertex_buffer: AllocatedBuffer,
-    vertex_buffer_address: vk::DeviceAddress,
-}
-
-struct Matrix {
-    model: glam::Mat4,
-}
-
 pub struct Renderer {
+    terrain_renderer: TerrainRenderer,
     ring_staging_buffer: RingStagingBuffer,
-    chunk_message_queue: VecDeque<ChunkMessage>,
-    loaded_chunk_meshes: HashMap<IVec3, Vec<AllocatedChunkMesh>>,
-    chunk_mesh_pool: VecDeque<AllocatedChunkMesh>,
-    allocator: Allocator,
+    allocator: Arc<Mutex<Allocator>>,
     world: Arc<World>,
     textures: Vec<Texture>,
-    pipeline: vk::Pipeline,
-    pipeline_layout: vk::PipelineLayout,
     global_descriptor_allocator: DescriptorAllocator,
     render_finished_semaphores: Vec<vk::Semaphore>,
     frame_number: usize,
@@ -99,22 +81,25 @@ impl Renderer {
         let mut swapchain = Swapchain::new(context.clone(), window.clone())?;
         swapchain.resize()?;
 
-        let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        let allocator = Arc::new(Mutex::new(Allocator::new(&AllocatorCreateDesc {
             instance: context.instance.clone(),
             device: context.device.clone(),
             physical_device: context.physical_device.handle,
             debug_settings: Default::default(),
             buffer_device_address: true,
             allocation_sizes: Default::default(),
-        })?;
+        })?));
 
         let mut textures: Vec<Texture> = Vec::new();
-        let grass_texture =
-            Texture::load_texture_from_file("textures/grass.png", context.clone(), &mut allocator)?;
+        let grass_texture = Texture::load_texture_from_file(
+            "textures/grass.png",
+            context.clone(),
+            &mut allocator.lock(),
+        )?;
         let stone_texture = Texture::load_texture_from_file(
             "textures/stone.webp",
             context.clone(),
-            &mut allocator,
+            &mut allocator.lock(),
         )?;
         textures.push(grass_texture);
         textures.push(stone_texture);
@@ -123,15 +108,19 @@ impl Renderer {
         let sizes = Vec::from([
             PoolSizeRatio {
                 desc_type: vk::DescriptorType::UNIFORM_BUFFER,
-                ratio: 1,
+                ratio: 2,
             },
             PoolSizeRatio {
                 desc_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 ratio: supported_textures,
             },
+            PoolSizeRatio {
+                desc_type: vk::DescriptorType::STORAGE_IMAGE,
+                ratio: 1,
+            },
         ]);
         let global_descriptor_allocator =
-            DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32, sizes)?;
+            DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32 * 2, sizes)?;
 
         unsafe {
             let mut render_finished_semaphores: Vec<vk::Semaphore> =
@@ -141,48 +130,6 @@ impl Renderer {
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
                 render_finished_semaphores.push(render_finished_semaphore);
-            }
-
-            let render_distance;
-            {
-                let player = world.player.read();
-                render_distance = player.render_distance;
-            }
-            let mut chunk_mesh_pool = VecDeque::new();
-            for _ in 0..render_distance * render_distance * 4 * textures.len() as u32 {
-                // Maximum number of vertices in a chunk
-                let vertex_buffer_size = (16 * 16 * 16 * std::mem::size_of::<Vertex>()) as u64;
-
-                let vertex_buffer = context.create_buffer(
-                    "Vertex buffer",
-                    &mut allocator,
-                    vertex_buffer_size,
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    gpu_allocator::MemoryLocation::GpuOnly,
-                )?;
-
-                let index_buffer_size = (6 * 16 * 16 * 16 * 3 * std::mem::size_of::<u32>()) as u64;
-                let index_buffer = context.create_buffer(
-                    "Index buffer",
-                    &mut allocator,
-                    index_buffer_size,
-                    vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                    gpu_allocator::MemoryLocation::GpuOnly,
-                )?;
-
-                let vertex_buffer_address = context.device.get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
-                );
-                chunk_mesh_pool.push_back(AllocatedChunkMesh {
-                    index_count: 0,
-                    first_index: 0,
-                    material: 0,
-                    index_buffer,
-                    vertex_buffer,
-                    vertex_buffer_address,
-                });
             }
 
             let mut frames: Vec<Frame> = Vec::with_capacity(FRAME_OVERLAP);
@@ -215,20 +162,28 @@ impl Renderer {
 
                 let uniform_buffer = context.create_buffer(
                     "Uniform buffer",
-                    &mut allocator,
+                    &mut allocator.lock(),
                     std::mem::size_of::<UniformBufferObject>() as u64,
                     vk::BufferUsageFlags::UNIFORM_BUFFER,
                     gpu_allocator::MemoryLocation::CpuToGpu,
                 )?;
-                let mut descriptor_layout_builder = DescriptorLayoutBuilder::new();
-                descriptor_layout_builder.add_binding(
+                let ray_traversal_uniform_buffer = context.create_buffer(
+                    "Ray traversal uniform buffer",
+                    &mut allocator.lock(),
+                    std::mem::size_of::<RayTraversalUBO>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    gpu_allocator::MemoryLocation::CpuToGpu,
+                )?;
+                let mut vertex_terrain_descriptor_layout_builder = DescriptorLayoutBuilder::new();
+                let mut ray_traversal_descriptor_layout_builder = DescriptorLayoutBuilder::new();
+                vertex_terrain_descriptor_layout_builder.add_binding(
                     0,
                     vk::DescriptorType::UNIFORM_BUFFER,
                     1,
                     vk::ShaderStageFlags::VERTEX,
                     vk::DescriptorBindingFlags::empty(),
                 );
-                descriptor_layout_builder.add_binding(
+                vertex_terrain_descriptor_layout_builder.add_binding(
                     1,
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                     supported_textures,
@@ -237,13 +192,34 @@ impl Renderer {
                         | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
                         | vk::DescriptorBindingFlags::PARTIALLY_BOUND,
                 );
+                ray_traversal_descriptor_layout_builder.add_binding(
+                    0,
+                    vk::DescriptorType::STORAGE_IMAGE,
+                    1,
+                    vk::ShaderStageFlags::COMPUTE,
+                    vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                );
+                ray_traversal_descriptor_layout_builder.add_binding(
+                    1,
+                    vk::DescriptorType::UNIFORM_BUFFER,
+                    1,
+                    vk::ShaderStageFlags::COMPUTE,
+                    vk::DescriptorBindingFlags::empty(),
+                );
+                let vertex_terrain_descriptor_layout =
+                    vertex_terrain_descriptor_layout_builder.build(&context.device)?;
+                let ray_traversal_descriptor_layout =
+                    ray_traversal_descriptor_layout_builder.build(&context.device)?;
 
-                let descriptor_layout = descriptor_layout_builder.build(&context.device)?;
-
-                let descriptors = global_descriptor_allocator.allocate(
+                let vertex_terrain_descriptors = global_descriptor_allocator.allocate(
                     &context.device,
-                    descriptor_layout,
+                    vertex_terrain_descriptor_layout,
                     &[supported_textures],
+                )?;
+                let ray_traversal_descriptors = global_descriptor_allocator.allocate(
+                    &context.device,
+                    ray_traversal_descriptor_layout,
+                    &[],
                 )?;
 
                 let mut desc_writes: Vec<vk::WriteDescriptorSet> = Vec::new();
@@ -253,11 +229,35 @@ impl Renderer {
                 desc_writes.push(
                     vk::WriteDescriptorSet::default()
                         .dst_binding(0)
-                        .dst_set(descriptors)
+                        .dst_set(vertex_terrain_descriptors)
                         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                         .descriptor_count(1)
                         .buffer_info(uniform_desc_info),
                 );
+
+                let draw_image_desc_info = &[vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::GENERAL)
+                    .image_view(swapchain.draw_image.image_view)];
+                desc_writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(0)
+                        .dst_set(ray_traversal_descriptors)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(1)
+                        .image_info(draw_image_desc_info),
+                );
+                let rt_uniform_desc_info = &[vk::DescriptorBufferInfo::default()
+                    .buffer(ray_traversal_uniform_buffer.buffer)
+                    .range(std::mem::size_of::<RayTraversalUBO>() as u64)];
+                desc_writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(1)
+                        .dst_set(ray_traversal_descriptors)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(rt_uniform_desc_info),
+                );
+
                 let image_infos: Vec<vk::DescriptorImageInfo> = textures
                     .iter()
                     .map(|tex| {
@@ -270,17 +270,19 @@ impl Renderer {
 
                 let tex_write = vk::WriteDescriptorSet::default()
                     .dst_binding(1)
-                    .dst_set(descriptors)
+                    .dst_set(vertex_terrain_descriptors)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(1)
                     .image_info(&image_infos);
                 desc_writes.push(tex_write);
 
                 context.device.update_descriptor_sets(&desc_writes, &[]);
 
                 frames.push(Frame {
-                    descriptors,
-                    descriptor_layout,
+                    ray_traversal_descriptors,
+                    ray_traversal_descriptor_layout,
+                    ray_traversal_uniform_buffer,
+                    vertex_terrain_descriptors,
+                    vertex_terrain_descriptor_layout,
                     uniform_buffer,
                     image_available_semaphore,
                     in_flight_fence,
@@ -289,52 +291,41 @@ impl Renderer {
                 });
             }
 
-            let descriptor_set_layouts = frames
+            let vertex_terrain_descriptor_set_layouts = frames
                 .iter()
-                .map(|frame| return frame.descriptor_layout)
+                .map(|frame| return frame.vertex_terrain_descriptor_layout)
                 .collect::<Vec<_>>();
-            let pipeline_layout = context.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&descriptor_set_layouts)
-                    .push_constant_ranges(&[vk::PushConstantRange::default()
-                        .offset(0)
-                        .size(std::mem::size_of::<GPUDrawPushConstants>() as u32)
-                        .stage_flags(vk::ShaderStageFlags::VERTEX)]),
-                None,
-            )?;
 
-            let vertex_shader =
-                resources::load_shader_module("compiled_shaders/shader.vert.spv", &context.device)?;
-            let fragment_shader =
-                resources::load_shader_module("compiled_shaders/shader.frag.spv", &context.device)?;
-            let pipeline = context.create_graphics_pipeline(
-                vk::Extent2D::default()
-                    .width(swapchain.draw_image.extent.width)
-                    .height(swapchain.draw_image.extent.height),
-                swapchain.draw_image.image_format,
-                swapchain.depth_image.image_format,
-                vertex_shader,
-                fragment_shader,
-                pipeline_layout,
-                Default::default(),
-            )?;
-            context.device.destroy_shader_module(vertex_shader, None);
-            context.device.destroy_shader_module(fragment_shader, None);
+            let ray_traversal_descriptor_set_layouts = frames
+                .iter()
+                .map(|frame| return frame.ray_traversal_descriptor_layout)
+                .collect::<Vec<_>>();
 
+            let render_distance;
+            {
+                let player = world.player.read();
+                render_distance = player.render_distance;
+            }
             Ok(Self {
-                chunk_message_queue: VecDeque::new(),
-                chunk_mesh_pool,
-                loaded_chunk_meshes: HashMap::new(),
+                terrain_renderer: TerrainRenderer::new(
+                    terrain::TerrainRenderMode::ComputeRayTracing,
+                    world.clone(),
+                    render_distance,
+                    textures.len() as u32,
+                    context.clone(),
+                    allocator.clone(),
+                    &swapchain,
+                    &vertex_terrain_descriptor_set_layouts,
+                    &ray_traversal_descriptor_set_layouts,
+                )?,
                 ring_staging_buffer: RingStagingBuffer::new(
                     context.clone(),
-                    &mut allocator,
+                    &mut allocator.lock(),
                     64 * 1024 * 1024,
                 )?,
-                allocator,
+                allocator: allocator.clone(),
                 world,
                 textures,
-                pipeline,
-                pipeline_layout,
                 global_descriptor_allocator,
                 render_finished_semaphores,
                 frame_number: 0,
@@ -361,10 +352,8 @@ impl Renderer {
             );
             proj.y_axis.y *= -1.0;
 
-            let ubo = UniformBufferObject {
-                view: player.camera.get_view_matrix(),
-                proj,
-            };
+            let view = player.camera.get_view_matrix();
+            let ubo = UniformBufferObject { view, proj };
             let ubo_ptr = frame
                 .uniform_buffer
                 .allocation
@@ -372,6 +361,19 @@ impl Renderer {
                 .unwrap()
                 .as_ptr();
             std::ptr::copy_nonoverlapping(&ubo, ubo_ptr.cast(), 1);
+
+            let rtubo = RayTraversalUBO {
+                inv_view: view.inverse(),
+                inv_proj: proj.inverse(),
+                camera_pos: player.camera.position.extend(1.0),
+            };
+            let rtubo_ptr = frame
+                .ray_traversal_uniform_buffer
+                .allocation
+                .mapped_ptr()
+                .unwrap()
+                .as_ptr();
+            std::ptr::copy_nonoverlapping(&rtubo, rtubo_ptr.cast(), 1);
         }
     }
 
@@ -415,86 +417,11 @@ impl Renderer {
 
             Self::upload_uniform_buffer(self.world.clone(), &self.swapchain, frame);
 
-            while let stdOk(chunk_message) = self.world.get_receiver().try_recv() {
-                self.chunk_message_queue.push_back(chunk_message);
-            }
-
-            'outer: while !self.chunk_message_queue.is_empty() {
-                let chunk_message = self.chunk_message_queue.pop_front().unwrap();
-                match &chunk_message {
-                    ChunkMessage::Load(chunk_meshes) => {
-                        let mut loaded_chunks = HashMap::new();
-                        for chunk_mesh in &chunk_meshes.1 {
-                            if let Some(mut allocated_chunk_mesh) = self.chunk_mesh_pool.pop_front()
-                            {
-                                let verts = &chunk_mesh.vertices;
-                                let indices = Vertex::generate_indices(verts.len());
-                                let vert_allocation =
-                                    self.ring_staging_buffer.push(&verts, frame_index);
-                                let index_allocation =
-                                    self.ring_staging_buffer.push(&indices, frame_index);
-
-                                if vert_allocation.is_err() || index_allocation.is_err() {
-                                    self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
-                                    self.chunk_message_queue.push_back(chunk_message);
-                                    for loaded_chunk in loaded_chunks {
-                                        if let Some(old_meshes) = self
-                                            .loaded_chunk_meshes
-                                            .insert(loaded_chunk.0, loaded_chunk.1)
-                                        {
-                                            for mesh in old_meshes {
-                                                self.chunk_mesh_pool.push_back(mesh);
-                                            }
-                                        }
-                                    }
-                                    break 'outer;
-                                }
-
-                                self.ring_staging_buffer.transfer(
-                                    self.context.clone(),
-                                    frame.command_buffer,
-                                    vert_allocation?,
-                                    &allocated_chunk_mesh.vertex_buffer,
-                                    vk::PipelineStageFlags2::VERTEX_SHADER,
-                                    vk::AccessFlags2::SHADER_READ,
-                                );
-                                self.ring_staging_buffer.transfer(
-                                    self.context.clone(),
-                                    frame.command_buffer,
-                                    index_allocation?,
-                                    &allocated_chunk_mesh.index_buffer,
-                                    vk::PipelineStageFlags2::VERTEX_SHADER,
-                                    vk::AccessFlags2::SHADER_READ,
-                                );
-                                allocated_chunk_mesh.material = chunk_mesh.material;
-                                allocated_chunk_mesh.index_count = indices.len() as u32;
-                                loaded_chunks
-                                    .entry(chunk_mesh.chunk_pos)
-                                    .or_insert_with(Vec::new)
-                                    .push(allocated_chunk_mesh);
-                            }
-                        }
-                        for loaded_chunk in loaded_chunks {
-                            if let Some(old_meshes) = self
-                                .loaded_chunk_meshes
-                                .insert(loaded_chunk.0, loaded_chunk.1)
-                            {
-                                for mesh in old_meshes {
-                                    self.chunk_mesh_pool.push_back(mesh);
-                                }
-                            }
-                        }
-                    }
-                    ChunkMessage::Unload(pos) => match self.loaded_chunk_meshes.remove(&pos) {
-                        Some(allocated_chunk_meshes) => {
-                            for allocated_chunk_mesh in allocated_chunk_meshes {
-                                self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
-                            }
-                        }
-                        None => {}
-                    },
-                }
-            }
+            self.terrain_renderer.receive_chunks(
+                &mut self.ring_staging_buffer,
+                frame,
+                frame_index,
+            )?;
 
             self.context.transition_image_layout(
                 frame.command_buffer,
@@ -542,55 +469,8 @@ impl Renderer {
                 &[vk::Rect2D::default().extent(extent)],
             );
 
-            self.context.device.cmd_bind_pipeline(
-                frame.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline,
-            );
-
-            self.context.device.cmd_bind_descriptor_sets(
-                frame.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[frame.descriptors],
-                &[],
-            );
-
-            for (offset, allocated_meshes) in self.loaded_chunk_meshes.iter() {
-                for allocated_mesh in allocated_meshes {
-                    let push_constants = GPUDrawPushConstants {
-                        vertex_buffer: allocated_mesh.vertex_buffer_address,
-                        material_id: allocated_mesh.material,
-                    };
-                    self.context.device.cmd_push_constants(
-                        frame.command_buffer,
-                        self.pipeline_layout,
-                        vk::ShaderStageFlags::VERTEX,
-                        0,
-                        std::slice::from_raw_parts(
-                            &push_constants as *const _ as *const u8,
-                            std::mem::size_of::<GPUDrawPushConstants>(),
-                        ),
-                    );
-
-                    self.context.device.cmd_bind_index_buffer(
-                        frame.command_buffer,
-                        allocated_mesh.index_buffer.buffer,
-                        0,
-                        vk::IndexType::UINT32,
-                    );
-
-                    self.context.device.cmd_draw_indexed(
-                        frame.command_buffer,
-                        allocated_mesh.index_count,
-                        1,
-                        allocated_mesh.first_index,
-                        0,
-                        0,
-                    );
-                }
-            }
+            self.terrain_renderer
+                .record_commands(frame, extent, &self.swapchain);
 
             self.context.device.cmd_end_rendering(frame.command_buffer);
 
@@ -685,37 +565,28 @@ impl Drop for Renderer {
                     .device
                     .destroy_command_pool(frame.command_pool, None);
                 self.context
-                    .destroy_buffer(&mut self.allocator, &mut frame.uniform_buffer);
+                    .destroy_buffer(&mut self.allocator.lock(), &mut frame.uniform_buffer);
+                self.context.destroy_buffer(
+                    &mut self.allocator.lock(),
+                    &mut frame.ray_traversal_uniform_buffer,
+                );
                 self.context
                     .device
-                    .destroy_descriptor_set_layout(frame.descriptor_layout, None);
+                    .destroy_descriptor_set_layout(frame.vertex_terrain_descriptor_layout, None);
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(frame.ray_traversal_descriptor_layout, None);
             });
 
             self.global_descriptor_allocator
                 .destroy_pool(&self.context.device);
 
-            self.context
-                .device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.context.device.destroy_pipeline(self.pipeline, None);
-            for loaded_chunk_meshes in &mut self.loaded_chunk_meshes {
-                for loaded_chunk_mesh in loaded_chunk_meshes.1 {
-                    self.context
-                        .destroy_buffer(&mut self.allocator, &mut loaded_chunk_mesh.vertex_buffer);
-                    self.context
-                        .destroy_buffer(&mut self.allocator, &mut loaded_chunk_mesh.index_buffer);
-                }
-            }
-            for loaded_chunk_mesh in &mut self.chunk_mesh_pool {
-                self.context
-                    .destroy_buffer(&mut self.allocator, &mut loaded_chunk_mesh.vertex_buffer);
-                self.context
-                    .destroy_buffer(&mut self.allocator, &mut loaded_chunk_mesh.index_buffer);
-            }
-            self.context
-                .destroy_buffer(&mut self.allocator, &mut self.ring_staging_buffer.buffer);
+            self.context.destroy_buffer(
+                &mut self.allocator.lock(),
+                &mut self.ring_staging_buffer.buffer,
+            );
             for texture in &mut self.textures {
-                Texture::destroy_texture(self.context.clone(), &mut self.allocator, texture);
+                Texture::destroy_texture(self.context.clone(), &mut self.allocator.lock(), texture);
             }
         }
     }

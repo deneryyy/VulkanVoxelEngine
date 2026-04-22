@@ -1,0 +1,98 @@
+#version 460
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba16f, set = 0, binding = 0) writeonly uniform image2D targetImage;
+
+layout(set = 0, binding = 1) uniform CameraData {
+    mat4 inv_view;     
+    mat4 inv_proj;     
+    vec4 camera_pos; 
+};
+
+bool is_solid(ivec3 pos) {
+    // Bounds check
+    if (pos.x < 0 || pos.x >= 64 || 
+        pos.y < 0 || pos.y >= 64 || 
+        pos.z < 0 || pos.z >= 64) {
+        return false;
+    }
+    /*
+    if (pos.x >= 27 && pos.x <= 37 &&
+        pos.y >= 27 && pos.y <= 37 &&
+        pos.z >= 27 && pos.z <= 37) {
+        return true;
+    }
+    */
+    if (pos == ivec3(0)) {
+        return true;
+    }
+    
+    return false;
+}
+
+vec3 trace_naive(vec3 origin, vec3 direction, float max_dist) {
+    float step_size = 0.05;  // Fixed step size
+    vec3 pos = origin;
+    float traveled = 0.0;
+    
+    for (int step = 0; step < 1000; step++) {
+        ivec3 voxel = ivec3(floor(pos));
+        
+        if (is_solid(voxel)) {
+            return vec3(voxel);  // Hit!
+        }
+        
+        // Step forward
+        pos += direction * step_size;
+        traveled += step_size;
+        
+        // Stop if we go too far
+        if (traveled > max_dist) {
+            break;
+        }
+    }
+    
+    return vec3(-1.0);  // No hit
+}
+
+vec3 visualize_ray_direction(vec3 dir) {
+    // Convert direction to a color
+    return vec3(abs(dir.x), abs(dir.y), abs(dir.z));
+}
+
+void main() 
+{
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 imageSize = imageSize(targetImage);
+
+    if (any(greaterThanEqual(pixelCoord, imageSize)))
+        return;
+
+
+    vec2 uv = vec2(pixelCoord) / vec2(imageSize);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 1.0, 1.0);
+    
+    vec4 view_ray = inv_proj * ndc;
+    view_ray = vec4(normalize(view_ray.xyz), 0.0);
+    
+    vec4 world_ray = inv_view * view_ray;
+    vec3 ray_dir = normalize(world_ray.xyz);
+    vec3 ray_origin = camera_pos.xyz;
+
+    vec3 hit = trace_naive(ray_origin, ray_dir, 100.0);
+
+    vec4 color;
+    if (hit.x < 0.0) {
+        color = vec4(visualize_ray_direction(ray_dir), 1.0);
+        //color = vec4(0.0, 0.0, 0.0, 1.0);  // Black = no hit
+    } else {
+        color = vec4(
+            1.0,
+            1.0,
+            1.0,
+            1.0
+        );
+    }
+    imageStore(targetImage, pixelCoord, color);
+}

@@ -3,7 +3,7 @@ pub mod renderer;
 pub mod resources;
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc},
     thread,
     time::Instant,
 };

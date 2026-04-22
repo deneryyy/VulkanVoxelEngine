@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use ash::vk::{self, ImageSubresourceRange};
+use ash::vk::{self};
 use gpu_allocator::{
-    MemoryLocation,
-    vulkan::{AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
+    vulkan::{Allocator, AllocatorCreateDesc},
 };
 use winit::window::Window;
 

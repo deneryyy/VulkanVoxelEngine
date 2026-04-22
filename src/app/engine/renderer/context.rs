@@ -1,14 +1,13 @@
-use core::ffi;
 use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Ok, Result};
 use ash::vk::{
-    self, BufferCreateInfo, CommandBufferUsageFlags, ImageSubresourceLayers, ImageSubresourceRange,
+    self, BufferCreateInfo, CommandBufferUsageFlags, ImageSubresourceLayers,
     PipelineDepthStencilStateCreateInfo, RenderingAttachmentInfo,
 };
 use gpu_allocator::{
     MemoryLocation,
-    vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
+    vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator},
 };
 use winit::{
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
@@ -204,6 +203,7 @@ impl RenderingContext {
                         &mut vk::PhysicalDeviceVulkan12Features::default()
                             .buffer_device_address(true)
                             .descriptor_indexing(true)
+                            .descriptor_binding_storage_image_update_after_bind(true)
                             .descriptor_binding_sampled_image_update_after_bind(true)
                             .descriptor_binding_variable_descriptor_count(true)
                             .descriptor_binding_partially_bound(true)

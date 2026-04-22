@@ -74,13 +74,13 @@ impl World {
                 input_manager.clone(),
                 Vec3 {
                     x: 2.0,
-                    y: 200.0,
+                    y: 2.0,
                     z: 2.0,
                 },
                 Camera::new(
                     Vec3 {
                         x: 2.0,
-                        y: 200.0,
+                        y: 2.0,
                         z: 2.0,
                     },
                     Vec3 {
@@ -193,18 +193,19 @@ impl World {
         chunk
     }
 
+    #[inline(always)]
     pub fn get_block_id(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        let chunk_x = x.rem_euclid(16) as usize;
-        let chunk_y = y.rem_euclid(16) as usize;
-        let chunk_z = z.rem_euclid(16) as usize;
+        let local_x = (x & 15) as usize;
+        let local_y = (y & 15) as usize;
+        let local_z = (z & 15) as usize;
         let chunks = self.chunks.read();
         chunks
             .get(&IVec3 {
-                x: x.div_euclid(16),
-                y: y.div_euclid(16),
-                z: z.div_euclid(16),
+                x: x >> 4,
+                y: y >> 4,
+                z: z >> 4,
             })
-            .map(|chunk| chunk.get_block_id(chunk_x, chunk_y, chunk_z))
+            .map(|chunk| chunk.get_block_id(local_x, local_y, local_z))
     }
 
     fn should_render_face(&self, neighbor: &BlockType) -> bool {
@@ -248,17 +249,17 @@ impl World {
         let mut chunk_meshes = Vec::new();
         let mut vertices_per_material = HashMap::new();
         for block_id in chunk.block_ids.iter().enumerate() {
+            if *block_id.1 == 0 {
+                continue;
+            }
+
             let index = block_id.0 as u32;
             let x = index % 16;
             let z = (index / 16) % 16;
             let y = ((index / 16) / 16) % 16;
-            let xn = offset.x * 16 + x as i32;
-            let yn = offset.y * 16 + y as i32;
-            let zn = offset.z * 16 + z as i32;
-
-            if *block_id.1 == 0 {
-                continue;
-            }
+            let world_x = offset.x * 16 + x as i32;
+            let world_y = offset.y * 16 + y as i32;
+            let world_z = offset.z * 16 + z as i32;
 
             let block_type = registry::BLOCK_REGISTRY.get(*block_id.1).unwrap();
 
@@ -266,67 +267,67 @@ impl World {
                 block_type,
                 &mut vertices_per_material,
                 Face::XPlus,
-                xn,
-                yn,
-                zn,
-                xn + 1,
-                yn,
-                zn,
+                world_x,
+                world_y,
+                world_z,
+                world_x + 1,
+                world_y,
+                world_z,
             );
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
                 Face::XMinus,
-                xn,
-                yn,
-                zn,
-                xn - 1,
-                yn,
-                zn,
+                world_x,
+                world_y,
+                world_z,
+                world_x - 1,
+                world_y,
+                world_z,
             );
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
                 Face::YPlus,
-                xn,
-                yn,
-                zn,
-                xn,
-                yn + 1,
-                zn,
+                world_x,
+                world_y,
+                world_z,
+                world_x,
+                world_y + 1,
+                world_z,
             );
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
                 Face::YMinus,
-                xn,
-                yn,
-                zn,
-                xn,
-                yn - 1,
-                zn,
+                world_x,
+                world_y,
+                world_z,
+                world_x,
+                world_y - 1,
+                world_z,
             );
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
                 Face::ZPlus,
-                xn,
-                yn,
-                zn,
-                xn,
-                yn,
-                zn + 1,
+                world_x,
+                world_y,
+                world_z,
+                world_x,
+                world_y,
+                world_z + 1,
             );
             self.add_face(
                 block_type,
                 &mut vertices_per_material,
                 Face::ZMinus,
-                xn,
-                yn,
-                zn,
-                xn,
-                yn,
-                zn - 1,
+                world_x,
+                world_y,
+                world_z,
+                world_x,
+                world_y,
+                world_z - 1,
             );
         }
         for v in vertices_per_material {

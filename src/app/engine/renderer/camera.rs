@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 
-use winit::{
-    event::{ElementState, KeyEvent},
-    keyboard::{KeyCode, PhysicalKey},
-};
+use winit::keyboard::KeyCode;
 
 pub struct Camera {
     pub position: glam::Vec3,
@@ -48,12 +45,7 @@ impl Camera {
     }
 
     pub fn get_view_matrix(&self) -> glam::Mat4 {
-        let roll_mat = glam::Mat4::from_axis_angle(self.front, self.roll);
-        glam::Mat4::look_at_rh(
-            self.position,
-            self.position + self.front,
-            glam::Mat3::from_mat4(roll_mat) * self.up,
-        )
+        glam::Mat4::look_at_rh(self.position, self.position + self.front, self.world_up)
     }
 
     pub fn process_mouse_movement(&mut self, x: f32, y: f32) {
@@ -65,18 +57,27 @@ impl Camera {
         if self.pitch < -89.0 {
             self.pitch = -89.0;
         }
+
+        if self.yaw > 360.0 {
+            self.yaw -= 360.0;
+        } else if self.yaw < -360.0 {
+            self.yaw += 360.0;
+        }
+
         self.update_camera_vectors();
     }
 
     pub fn process_keys(&mut self, pressed_keys: HashSet<KeyCode>, delta_time: f32) {
         let mut movement = glam::Vec3::ZERO;
+        let front = self.front.normalize();
+        let right = self.right.normalize();
 
         for key in pressed_keys {
             match key {
-                KeyCode::KeyW => movement += self.front,
-                KeyCode::KeyS => movement -= self.front,
-                KeyCode::KeyD => movement += self.right,
-                KeyCode::KeyA => movement -= self.right,
+                KeyCode::KeyW => movement += front,
+                KeyCode::KeyS => movement -= front,
+                KeyCode::KeyD => movement += right,
+                KeyCode::KeyA => movement -= right,
                 KeyCode::Space => movement += self.world_up,
                 KeyCode::ShiftLeft => movement -= self.world_up,
                 _ => {}
