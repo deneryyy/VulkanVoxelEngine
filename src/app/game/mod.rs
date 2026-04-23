@@ -9,6 +9,7 @@ pub mod block;
 pub mod player;
 pub mod registry;
 pub mod world;
+pub mod settings;
 
 pub struct Game {
     world: Arc<World>,

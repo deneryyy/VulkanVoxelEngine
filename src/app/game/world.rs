@@ -25,9 +25,11 @@ use crate::app::{
         },
     },
     game::{
+        self,
         block::BlockType,
         player::Player,
         registry::{self},
+        settings::TerrainRenderMode,
     },
 };
 
@@ -52,7 +54,7 @@ pub struct ChunkMesh {
 }
 
 pub enum ChunkMessage {
-    Load((IVec3, Vec<ChunkMesh>)),
+    VertexLoad((IVec3, Vec<ChunkMesh>)),
     Unload(IVec3),
 }
 
@@ -109,6 +111,7 @@ impl World {
             Self::get_chunk_positions_square(player_position, render_distance as i32);
         let mut to_load = Vec::new();
         let mut to_unload = Vec::new();
+
         self.thread_pool.install(|| {
             {
                 let chunks = self.chunks.read();
@@ -135,16 +138,19 @@ impl World {
                 let mut chunks = self.chunks.write();
                 chunks.remove(&chunk_position);
             }
-            to_load.into_par_iter().for_each(|chunk_position| {
-                let chunks = self.chunks.read();
-                let chunk = chunks.get(&chunk_position).unwrap();
-                self.sender
-                    .send(ChunkMessage::Load((
-                        chunk_position,
-                        self.get_chunk_meshes(chunk, &chunk_position),
-                    )))
-                    .unwrap();
-            });
+            let terrain_render_mode = game::settings::GAME_SETTINGS.terrain_render_mode;
+            if terrain_render_mode == TerrainRenderMode::Vertex {
+                to_load.into_par_iter().for_each(|chunk_position| {
+                    let chunks = self.chunks.read();
+                    let chunk = chunks.get(&chunk_position).unwrap();
+                    self.sender
+                        .send(ChunkMessage::VertexLoad((
+                            chunk_position,
+                            self.get_chunk_meshes(chunk, &chunk_position),
+                        )))
+                        .unwrap();
+                });
+            }
         });
     }
 

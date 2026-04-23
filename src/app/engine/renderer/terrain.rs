@@ -22,18 +22,24 @@ use crate::app::{
         },
         resources,
     },
-    game::world::{ChunkMessage, World},
+    game::{
+        self,
+        block::MaterialPerFace,
+        registry,
+        settings::TerrainRenderMode,
+        world::{ChunkMessage, World},
+    },
 };
-
-pub enum TerrainRenderMode {
-    Vertex,
-    ComputeRayTracing,
-}
 
 #[repr(C, align(16))]
 struct VertexTerrainPushConstants {
     vertex_buffer: vk::DeviceAddress,
     material_id: u32,
+}
+
+#[repr(C, align(16))]
+struct RayTraversalPushConstants {
+    material_buffer: vk::DeviceAddress,
 }
 
 pub struct AllocatedChunkMesh {
@@ -47,6 +53,8 @@ pub struct AllocatedChunkMesh {
 
 pub struct TerrainRenderer {
     pub terrain_render_mode: TerrainRenderMode,
+    pub material_buffer_address: vk::DeviceAddress,
+    pub material_buffer: AllocatedBuffer,
     pub ray_traversal_pipeline: vk::Pipeline,
     pub ray_traversal_pipeline_layout: vk::PipelineLayout,
     pub context: Arc<RenderingContext>,
@@ -61,7 +69,6 @@ pub struct TerrainRenderer {
 
 impl TerrainRenderer {
     pub fn new<'a>(
-        terrain_render_mode: TerrainRenderMode,
         world: Arc<World>,
         render_distance: u32,
         texture_num: u32,
@@ -69,51 +76,58 @@ impl TerrainRenderer {
         allocator: Arc<Mutex<Allocator>>,
         swapchain: &Swapchain,
         vertex_terrain_descriptor_set_layouts: &'a [vk::DescriptorSetLayout],
+        texture_descriptor_set_layout: &'a vk::DescriptorSetLayout,
         ray_traversal_descriptor_set_layouts: &'a [vk::DescriptorSetLayout],
     ) -> Result<Self> {
+        let terrain_render_mode = game::settings::GAME_SETTINGS.terrain_render_mode;
         let mut chunk_mesh_pool = VecDeque::new();
-        for _ in 0..render_distance * render_distance * 4 * texture_num {
-            // Maximum number of vertices in a chunk
-            let vertex_buffer_size = (16 * 16 * 16 * std::mem::size_of::<Vertex>()) as u64;
+        if terrain_render_mode == TerrainRenderMode::Vertex {
+            for _ in 0..render_distance * render_distance * 4 * texture_num {
+                // Maximum number of vertices in a chunk
+                let vertex_buffer_size = (16 * 16 * 16 * std::mem::size_of::<Vertex>()) as u64;
 
-            let vertex_buffer = context.create_buffer(
-                "Vertex buffer",
-                &mut allocator.lock(),
-                vertex_buffer_size,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                gpu_allocator::MemoryLocation::GpuOnly,
-            )?;
+                let vertex_buffer = context.create_buffer(
+                    "Vertex buffer",
+                    &mut allocator.lock(),
+                    vertex_buffer_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_DST
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    gpu_allocator::MemoryLocation::GpuOnly,
+                )?;
 
-            let index_buffer_size = (6 * 16 * 16 * 16 * 3 * std::mem::size_of::<u32>()) as u64;
-            let index_buffer = context.create_buffer(
-                "Index buffer",
-                &mut allocator.lock(),
-                index_buffer_size,
-                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                gpu_allocator::MemoryLocation::GpuOnly,
-            )?;
+                let index_buffer_size = (6 * 16 * 16 * 16 * 3 * std::mem::size_of::<u32>()) as u64;
+                let index_buffer = context.create_buffer(
+                    "Index buffer",
+                    &mut allocator.lock(),
+                    index_buffer_size,
+                    vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuOnly,
+                )?;
 
-            let vertex_buffer_address = unsafe {
-                context.device.get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
-                )
-            };
-            chunk_mesh_pool.push_back(AllocatedChunkMesh {
-                index_count: 0,
-                first_index: 0,
-                material: 0,
-                index_buffer,
-                vertex_buffer,
-                vertex_buffer_address,
-            });
+                let vertex_buffer_address = unsafe {
+                    context.device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
+                    )
+                };
+                chunk_mesh_pool.push_back(AllocatedChunkMesh {
+                    index_count: 0,
+                    first_index: 0,
+                    material: 0,
+                    index_buffer,
+                    vertex_buffer,
+                    vertex_buffer_address,
+                });
+            }
         }
 
+        let mut vertex_set_layouts = Vec::new();
+        vertex_set_layouts.extend_from_slice(vertex_terrain_descriptor_set_layouts);
+        vertex_set_layouts.push(*texture_descriptor_set_layout);
         let vertex_pipeline_layout = unsafe {
             context.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(vertex_terrain_descriptor_set_layouts)
+                    .set_layouts(&vertex_set_layouts)
                     .push_constant_ranges(&[vk::PushConstantRange::default()
                         .offset(0)
                         .size(std::mem::size_of::<VertexTerrainPushConstants>() as u32)
@@ -153,10 +167,17 @@ impl TerrainRenderer {
             &context.device,
         )?;
 
+        let mut ray_traversal_descriptors = Vec::new();
+        ray_traversal_descriptors.extend_from_slice(ray_traversal_descriptor_set_layouts);
+        ray_traversal_descriptors.push(*texture_descriptor_set_layout);
         let ray_traversal_pipeline_layout = unsafe {
             context.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(ray_traversal_descriptor_set_layouts),
+                    .set_layouts(&ray_traversal_descriptors)
+                    .push_constant_ranges(&[vk::PushConstantRange::default()
+                        .offset(0)
+                        .size(std::mem::size_of::<RayTraversalPushConstants>() as u32)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)]),
                 None,
             )?
         };
@@ -188,7 +209,64 @@ impl TerrainRenderer {
                 .device
                 .destroy_shader_module(ray_traversal_compute_shader, None);
         }
+
+        let materials = registry::BLOCK_REGISTRY
+            .map
+            .iter()
+            .map(|block| block.1.get_material_per_face())
+            .collect::<Vec<MaterialPerFace>>();
+        let materials_size = (std::mem::size_of::<MaterialPerFace>() * materials.len()) as u64;
+        let material_buffer = context.create_buffer(
+            "Material buffer",
+            &mut allocator.lock(),
+            materials_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            gpu_allocator::MemoryLocation::GpuOnly,
+        )?;
+
+        let mut staging_buffer = context.create_buffer(
+            "Staging buffer",
+            &mut allocator.lock(),
+            materials_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        )?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                materials.as_ptr(),
+                staging_buffer
+                    .allocation
+                    .mapped_ptr()
+                    .unwrap()
+                    .as_ptr()
+                    .cast(),
+                materials.len(),
+            );
+        }
+        let cmd = context.begin_immediate_submit()?;
+        unsafe {
+            context.device.cmd_copy_buffer(
+                cmd,
+                staging_buffer.buffer,
+                material_buffer.buffer,
+                &[vk::BufferCopy::default()
+                    .size(materials_size)
+                    .src_offset(0)
+                    .dst_offset(0)],
+            );
+        }
+        context.end_immediate_submit()?;
+        let material_buffer_address = unsafe {
+            context.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(material_buffer.buffer),
+            )
+        };
+        context.destroy_buffer(&mut allocator.lock(), &mut staging_buffer);
         Ok(Self {
+            material_buffer_address,
+            material_buffer,
             ray_traversal_pipeline,
             ray_traversal_pipeline_layout,
             terrain_render_mode,
@@ -209,88 +287,98 @@ impl TerrainRenderer {
         frame: &Frame,
         frame_index: usize,
     ) -> Result<()> {
-        while let stdOk(chunk_message) = self.world.get_receiver().try_recv() {
-            self.chunk_message_queue.push_back(chunk_message);
-        }
+        if self.terrain_render_mode == TerrainRenderMode::Vertex {
+            while let stdOk(chunk_message) = self.world.get_receiver().try_recv() {
+                self.chunk_message_queue.push_back(chunk_message);
+            }
+            'outer: while !self.chunk_message_queue.is_empty() {
+                let chunk_message = self.chunk_message_queue.pop_front().unwrap();
+                match &chunk_message {
+                    ChunkMessage::VertexLoad(chunk_meshes) => {
+                        let mut loaded_chunks = HashMap::new();
+                        for chunk_mesh in &chunk_meshes.1 {
+                            if let Some(mut allocated_chunk_mesh) = self.chunk_mesh_pool.pop_front()
+                            {
+                                let verts = &chunk_mesh.vertices;
+                                let indices = Vertex::generate_indices(verts.len());
+                                let vert_allocation = ring_staging_buffer.push(&verts, frame_index);
+                                let index_allocation =
+                                    ring_staging_buffer.push(&indices, frame_index);
 
-        'outer: while !self.chunk_message_queue.is_empty() {
-            let chunk_message = self.chunk_message_queue.pop_front().unwrap();
-            match &chunk_message {
-                ChunkMessage::Load(chunk_meshes) => {
-                    let mut loaded_chunks = HashMap::new();
-                    for chunk_mesh in &chunk_meshes.1 {
-                        if let Some(mut allocated_chunk_mesh) = self.chunk_mesh_pool.pop_front() {
-                            let verts = &chunk_mesh.vertices;
-                            let indices = Vertex::generate_indices(verts.len());
-                            let vert_allocation = ring_staging_buffer.push(&verts, frame_index);
-                            let index_allocation = ring_staging_buffer.push(&indices, frame_index);
-
-                            if vert_allocation.is_err() || index_allocation.is_err() {
-                                self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
-                                self.chunk_message_queue.push_back(chunk_message);
-                                for loaded_chunk in loaded_chunks {
-                                    if let Some(old_meshes) = self
-                                        .loaded_chunk_meshes
-                                        .insert(loaded_chunk.0, loaded_chunk.1)
-                                    {
-                                        for mesh in old_meshes {
-                                            self.chunk_mesh_pool.push_back(mesh);
+                                if vert_allocation.is_err() || index_allocation.is_err() {
+                                    self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
+                                    self.chunk_message_queue.push_back(chunk_message);
+                                    for loaded_chunk in loaded_chunks {
+                                        if let Some(old_meshes) = self
+                                            .loaded_chunk_meshes
+                                            .insert(loaded_chunk.0, loaded_chunk.1)
+                                        {
+                                            for mesh in old_meshes {
+                                                self.chunk_mesh_pool.push_back(mesh);
+                                            }
                                         }
                                     }
+                                    break 'outer;
                                 }
-                                break 'outer;
-                            }
 
-                            ring_staging_buffer.transfer(
-                                self.context.clone(),
-                                frame.command_buffer,
-                                vert_allocation?,
-                                &allocated_chunk_mesh.vertex_buffer,
-                                vk::PipelineStageFlags2::VERTEX_SHADER,
-                                vk::AccessFlags2::SHADER_READ,
-                            );
-                            ring_staging_buffer.transfer(
-                                self.context.clone(),
-                                frame.command_buffer,
-                                index_allocation?,
-                                &allocated_chunk_mesh.index_buffer,
-                                vk::PipelineStageFlags2::VERTEX_SHADER,
-                                vk::AccessFlags2::SHADER_READ,
-                            );
-                            allocated_chunk_mesh.material = chunk_mesh.material;
-                            allocated_chunk_mesh.index_count = indices.len() as u32;
-                            loaded_chunks
-                                .entry(chunk_mesh.chunk_pos)
-                                .or_insert_with(Vec::new)
-                                .push(allocated_chunk_mesh);
+                                ring_staging_buffer.transfer(
+                                    self.context.clone(),
+                                    frame.command_buffer,
+                                    vert_allocation?,
+                                    &allocated_chunk_mesh.vertex_buffer,
+                                    vk::PipelineStageFlags2::VERTEX_SHADER,
+                                    vk::AccessFlags2::SHADER_READ,
+                                );
+                                ring_staging_buffer.transfer(
+                                    self.context.clone(),
+                                    frame.command_buffer,
+                                    index_allocation?,
+                                    &allocated_chunk_mesh.index_buffer,
+                                    vk::PipelineStageFlags2::VERTEX_SHADER,
+                                    vk::AccessFlags2::SHADER_READ,
+                                );
+                                allocated_chunk_mesh.material = chunk_mesh.material;
+                                allocated_chunk_mesh.index_count = indices.len() as u32;
+                                loaded_chunks
+                                    .entry(chunk_mesh.chunk_pos)
+                                    .or_insert_with(Vec::new)
+                                    .push(allocated_chunk_mesh);
+                            }
                         }
-                    }
-                    for loaded_chunk in loaded_chunks {
-                        if let Some(old_meshes) = self
-                            .loaded_chunk_meshes
-                            .insert(loaded_chunk.0, loaded_chunk.1)
-                        {
-                            for mesh in old_meshes {
-                                self.chunk_mesh_pool.push_back(mesh);
+                        for loaded_chunk in loaded_chunks {
+                            if let Some(old_meshes) = self
+                                .loaded_chunk_meshes
+                                .insert(loaded_chunk.0, loaded_chunk.1)
+                            {
+                                for mesh in old_meshes {
+                                    self.chunk_mesh_pool.push_back(mesh);
+                                }
                             }
                         }
                     }
-                }
-                ChunkMessage::Unload(pos) => match self.loaded_chunk_meshes.remove(&pos) {
-                    Some(allocated_chunk_meshes) => {
-                        for allocated_chunk_mesh in allocated_chunk_meshes {
-                            self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
+                    ChunkMessage::Unload(pos) => match self.loaded_chunk_meshes.remove(&pos) {
+                        Some(allocated_chunk_meshes) => {
+                            for allocated_chunk_mesh in allocated_chunk_meshes {
+                                self.chunk_mesh_pool.push_back(allocated_chunk_mesh);
+                            }
                         }
-                    }
-                    None => {}
-                },
+                        None => {}
+                    },
+                }
             }
         }
 
         Ok(())
     }
 
-    pub fn record_commands(&self, frame: &Frame, extent: vk::Extent2D, swapchain: &Swapchain) {
+    pub fn record_commands(
+        &self,
+        frame: &Frame,
+        frames: &Vec<Frame>,
+        extent: vk::Extent2D,
+        swapchain: &Swapchain,
+        texture_set: vk::DescriptorSet,
+    ) {
         unsafe {
             match self.terrain_render_mode {
                 TerrainRenderMode::Vertex => {
@@ -306,6 +394,15 @@ impl TerrainRenderer {
                         self.vertex_pipeline_layout,
                         0,
                         &[frame.vertex_terrain_descriptors],
+                        &[],
+                    );
+
+                    self.context.device.cmd_bind_descriptor_sets(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.vertex_pipeline_layout,
+                        2,
+                        &[texture_set],
                         &[],
                     );
 
@@ -368,6 +465,27 @@ impl TerrainRenderer {
                         &[frame.ray_traversal_descriptors],
                         &[],
                     );
+                    self.context.device.cmd_bind_descriptor_sets(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.ray_traversal_pipeline_layout,
+                        2,
+                        &[texture_set],
+                        &[],
+                    );
+                    let push_constants = RayTraversalPushConstants {
+                        material_buffer: self.material_buffer_address,
+                    };
+                    self.context.device.cmd_push_constants(
+                        frame.command_buffer,
+                        self.ray_traversal_pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        std::slice::from_raw_parts(
+                            &push_constants as *const _ as *const u8,
+                            std::mem::size_of::<RayTraversalPushConstants>(),
+                        ),
+                    );
                     self.context.device.cmd_dispatch(
                         frame.command_buffer,
                         extent.width.div_ceil(16),
@@ -417,6 +535,7 @@ impl Drop for TerrainRenderer {
                     &mut loaded_chunk_mesh.index_buffer,
                 );
             }
+            self.context.destroy_buffer(&mut self.allocator.lock(), &mut self.material_buffer);
         }
     }
 }

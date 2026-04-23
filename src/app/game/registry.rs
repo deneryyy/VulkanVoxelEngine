@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::LazyLock};
 use crate::app::game::block::BlockType;
 
 pub struct Registry<T> {
-    map: HashMap<u32, T>,
+    pub map: HashMap<u32, T>,
 }
 
 pub static BLOCK_REGISTRY: LazyLock<Registry<BlockType>> = LazyLock::new(|| {

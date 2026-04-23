@@ -58,6 +58,8 @@ struct UniformBufferObject {
 
 pub struct Renderer {
     terrain_renderer: TerrainRenderer,
+    texture_descriptors: vk::DescriptorSet,
+    texture_descriptor_layout: vk::DescriptorSetLayout,
     ring_staging_buffer: RingStagingBuffer,
     allocator: Arc<Mutex<Allocator>>,
     world: Arc<World>,
@@ -120,9 +122,42 @@ impl Renderer {
             },
         ]);
         let global_descriptor_allocator =
-            DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32 * 2, sizes)?;
+            DescriptorAllocator::new(&context.device, FRAME_OVERLAP as u32 * 2 + 1, sizes)?;
 
+        let mut texture_descriptor_layout_builed = DescriptorLayoutBuilder::new();
+        texture_descriptor_layout_builed.add_binding(
+            0,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            supported_textures,
+            vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
+            vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
+                | vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+        );
+
+        let texture_descriptor_layout = texture_descriptor_layout_builed.build(&context.device)?;
+        let texture_descriptors = global_descriptor_allocator.allocate(
+            &context.device,
+            texture_descriptor_layout,
+            &[supported_textures],
+        )?;
+        let image_infos: Vec<vk::DescriptorImageInfo> = textures
+            .iter()
+            .map(|tex| {
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(tex.image.image_view)
+                    .sampler(tex.sampler)
+            })
+            .collect();
+
+        let tex_write = vk::WriteDescriptorSet::default()
+            .dst_binding(0)
+            .dst_set(texture_descriptors)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_infos);
         unsafe {
+            context.device.update_descriptor_sets(&[tex_write], &[]);
             let mut render_finished_semaphores: Vec<vk::Semaphore> =
                 Vec::with_capacity(swapchain.images.len() as usize);
             for _ in 0..swapchain.images.len() {
@@ -183,15 +218,6 @@ impl Renderer {
                     vk::ShaderStageFlags::VERTEX,
                     vk::DescriptorBindingFlags::empty(),
                 );
-                vertex_terrain_descriptor_layout_builder.add_binding(
-                    1,
-                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    supported_textures,
-                    vk::ShaderStageFlags::FRAGMENT,
-                    vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
-                        | vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-                        | vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-                );
                 ray_traversal_descriptor_layout_builder.add_binding(
                     0,
                     vk::DescriptorType::STORAGE_IMAGE,
@@ -214,7 +240,7 @@ impl Renderer {
                 let vertex_terrain_descriptors = global_descriptor_allocator.allocate(
                     &context.device,
                     vertex_terrain_descriptor_layout,
-                    &[supported_textures],
+                    &[],
                 )?;
                 let ray_traversal_descriptors = global_descriptor_allocator.allocate(
                     &context.device,
@@ -234,6 +260,8 @@ impl Renderer {
                         .descriptor_count(1)
                         .buffer_info(uniform_desc_info),
                 );
+
+                desc_writes.push(tex_write);
 
                 let draw_image_desc_info = &[vk::DescriptorImageInfo::default()
                     .image_layout(vk::ImageLayout::GENERAL)
@@ -258,23 +286,6 @@ impl Renderer {
                         .buffer_info(rt_uniform_desc_info),
                 );
 
-                let image_infos: Vec<vk::DescriptorImageInfo> = textures
-                    .iter()
-                    .map(|tex| {
-                        vk::DescriptorImageInfo::default()
-                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                            .image_view(tex.image.image_view)
-                            .sampler(tex.sampler)
-                    })
-                    .collect();
-
-                let tex_write = vk::WriteDescriptorSet::default()
-                    .dst_binding(1)
-                    .dst_set(vertex_terrain_descriptors)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&image_infos);
-                desc_writes.push(tex_write);
-
                 context.device.update_descriptor_sets(&desc_writes, &[]);
 
                 frames.push(Frame {
@@ -295,7 +306,6 @@ impl Renderer {
                 .iter()
                 .map(|frame| return frame.vertex_terrain_descriptor_layout)
                 .collect::<Vec<_>>();
-
             let ray_traversal_descriptor_set_layouts = frames
                 .iter()
                 .map(|frame| return frame.ray_traversal_descriptor_layout)
@@ -308,7 +318,6 @@ impl Renderer {
             }
             Ok(Self {
                 terrain_renderer: TerrainRenderer::new(
-                    terrain::TerrainRenderMode::ComputeRayTracing,
                     world.clone(),
                     render_distance,
                     textures.len() as u32,
@@ -316,8 +325,11 @@ impl Renderer {
                     allocator.clone(),
                     &swapchain,
                     &vertex_terrain_descriptor_set_layouts,
+                    &texture_descriptor_layout,
                     &ray_traversal_descriptor_set_layouts,
                 )?,
+                texture_descriptor_layout,
+                texture_descriptors,
                 ring_staging_buffer: RingStagingBuffer::new(
                     context.clone(),
                     &mut allocator.lock(),
@@ -470,7 +482,7 @@ impl Renderer {
             );
 
             self.terrain_renderer
-                .record_commands(frame, extent, &self.swapchain);
+                .record_commands(frame, &self.frames, extent, &self.swapchain, self.texture_descriptors);
 
             self.context.device.cmd_end_rendering(frame.command_buffer);
 
@@ -573,10 +585,14 @@ impl Drop for Renderer {
                 self.context
                     .device
                     .destroy_descriptor_set_layout(frame.vertex_terrain_descriptor_layout, None);
+
                 self.context
                     .device
                     .destroy_descriptor_set_layout(frame.ray_traversal_descriptor_layout, None);
             });
+            self.context
+                .device
+                .destroy_descriptor_set_layout(self.texture_descriptor_layout, None);
 
             self.global_descriptor_allocator
                 .destroy_pool(&self.context.device);

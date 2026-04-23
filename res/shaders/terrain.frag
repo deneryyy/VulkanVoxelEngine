@@ -2,7 +2,7 @@
 
 #extension GL_EXT_nonuniform_qualifier : require
 
-layout(binding = 1) uniform sampler2D texSampler[];
+layout(set = 2, binding = 0) uniform sampler2D texSampler[];
 
 layout(location = 0) in vec2 fragTexCoord;
 layout(location = 1) flat in uint materialId;

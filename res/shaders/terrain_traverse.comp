@@ -1,5 +1,8 @@
 #version 460
 
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+
 layout (local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba16f, set = 0, binding = 0) writeonly uniform image2D targetImage;
@@ -9,6 +12,25 @@ layout(set = 0, binding = 1) uniform CameraData {
     mat4 inv_proj;     
     vec4 camera_pos; 
 };
+layout(set = 2, binding = 0) uniform sampler2D texSampler[];
+
+struct MaterialPerFace {
+    uint xplus;
+    uint xminus;
+    uint yplus;
+    uint yminus;
+    uint zplus;
+    uint zminus;
+};
+
+layout(buffer_reference, std430) readonly buffer MaterialBuffer { 
+	MaterialPerFace materials[];
+};
+
+layout( push_constant ) uniform constants
+{	
+	MaterialBuffer materialBuffer;
+} PushConstants;
 
 struct HitResult {
     vec3 position;      
@@ -23,6 +45,11 @@ struct HitResult {
 const float FLT_MAX = 3.4028235e+38;
 
 bool is_solid(ivec3 pos) {
+    if (pos.x > 0 && pos.x < 64 &&
+        pos.z > 0 && pos.z < 64 &&
+        pos.y > 0 && pos.y < 64) {
+        return true;
+    }
     if (pos.y == 0) {
         return true;
     }
@@ -143,14 +170,27 @@ void main()
     vec3 ray_dir = normalize(world_ray.xyz);
     vec3 ray_origin = camera_pos.xyz;
 
-    HitResult hit = trace_dda(ray_origin, ray_dir, 10000, 500);
+    HitResult hit = trace_dda(ray_origin, ray_dir, 10000, 5000);
 
     vec4 color;
     float depth;
     float near_plane = 0.1;
     float far_plane = 1000.0;
     if (hit.hit) {
-        color = vec4(hit.uv, 0.0, 1.0);
+        MaterialPerFace materialPerFace = PushConstants.materialBuffer.materials[1];
+        if (hit.face == 0) {
+            color = texture(texSampler[materialPerFace.xplus], hit.uv);
+        } else if (hit.face == 1) {
+            color = texture(texSampler[materialPerFace.xminus], hit.uv);
+        } else if (hit.face == 2) {
+            color = texture(texSampler[materialPerFace.yplus], hit.uv);
+        } else if (hit.face == 3) {
+            color = texture(texSampler[materialPerFace.yminus], hit.uv);
+        } else if (hit.face == 4) {
+            color = texture(texSampler[materialPerFace.zplus], hit.uv);
+        } else if (hit.face == 5) {
+            color = texture(texSampler[materialPerFace.zminus], hit.uv);
+        }
     } else {
         color = vec4(
             0.0,
