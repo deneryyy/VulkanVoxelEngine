@@ -1,14 +1,19 @@
 mod app;
 
-use std::thread;
+use core::fmt;
 
 use anyhow::Result;
+use tracing_subscriber::EnvFilter;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-use crate::app::{App, game::Game};
+use crate::app::App;
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let filter_layer = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter_layer)
+        .init();
     let mut app = App::default();
 
     let event_loop = EventLoop::new()?;

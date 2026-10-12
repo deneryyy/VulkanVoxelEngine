@@ -1,8 +1,9 @@
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Ok, Result, anyhow};
 use ash::vk;
 use gpu_allocator::vulkan::Allocator;
+use image::buffer;
 
 use crate::app::engine::renderer::{
     FRAME_OVERLAP,
@@ -136,8 +137,8 @@ impl RingStagingBuffer {
         cmd: vk::CommandBuffer,
         allocation: RingStagingBufferAllocation,
         dst_buf: &AllocatedBuffer,
-        dst_stage_mask: vk::PipelineStageFlags2,
-        dst_access_mask: vk::AccessFlags2,
+        dst_stage_mask: vk::PipelineStageFlags,
+        dst_access_mask: vk::AccessFlags,
     ) {
         unsafe {
             context.device.cmd_copy_buffer(
@@ -149,20 +150,41 @@ impl RingStagingBuffer {
                     .src_offset(allocation.offset)
                     .size(allocation.size)],
             );
-            context.device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&[
-                    vk::BufferMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(dst_stage_mask)
-                        .dst_access_mask(dst_access_mask)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(dst_buf.buffer)
-                        .size(dst_buf.allocation.size()),
-                ]),
-            );
+            if context.use_sync2 {
+                context.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&[
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::from_raw(dst_stage_mask.as_raw() as u64))
+                            .dst_access_mask(vk::AccessFlags2::from_raw(dst_access_mask.as_raw() as u64))
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .buffer(dst_buf.buffer)
+                            .size(dst_buf.allocation.size()),
+                    ]),
+                );
+            } else {
+                let barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(dst_access_mask)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(dst_buf.buffer)
+                    .offset(0)
+                    .size(dst_buf.allocation.size());
+
+                context.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    dst_stage_mask,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[barrier],
+                    &[],
+                );
+            }
         }
     }
 

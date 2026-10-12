@@ -26,8 +26,8 @@ pub fn load_spirv(data: Vec<u8>) -> anyhow::Result<Vec<u32>> {
     Ok(ash::util::read_spv(&mut std::io::Cursor::new(data))?)
 }
 
-pub fn load_shader_module(path: &str, input_file_name: &str, shader_kind: shaderc::ShaderKind, device: &ash::Device) -> anyhow::Result<vk::ShaderModule> {
-    let binary_data = load_spirv(compile_shader(load_string(path)?.as_str(), input_file_name, shader_kind)?)?;
+pub fn load_shader_module(code: &str, input_file_name: &str, shader_kind: shaderc::ShaderKind, device: &ash::Device) -> anyhow::Result<vk::ShaderModule> {
+    let binary_data = load_spirv(compile_shader(code, input_file_name, shader_kind)?)?;
 
     unsafe {
         Ok(device.create_shader_module(

@@ -10,6 +10,7 @@ use gpu_allocator::vulkan::Allocator;
 use parking_lot::Mutex;
 use shaderc::ShaderKind;
 use std::result::Result::Ok as stdOk;
+use tracing::info;
 
 use crate::app::{
     engine::{
@@ -38,6 +39,11 @@ struct VertexTerrainPushConstants {
 }
 
 #[repr(C, align(16))]
+struct LegacyVertexTerrainPushConstants {
+    material_id: u32,
+}
+
+#[repr(C, align(16))]
 struct RayTraversalPushConstants {
     material_buffer: vk::DeviceAddress,
 }
@@ -48,12 +54,11 @@ pub struct AllocatedChunkMesh {
     pub material: u32,
     pub index_buffer: AllocatedBuffer,
     pub vertex_buffer: AllocatedBuffer,
-    pub vertex_buffer_address: vk::DeviceAddress,
+    pub vertex_buffer_address: Option<vk::DeviceAddress>,
 }
 
 pub struct TerrainRenderer {
     pub terrain_render_mode: TerrainRenderMode,
-    pub material_buffer_address: vk::DeviceAddress,
     pub material_buffer: AllocatedBuffer,
     pub ray_traversal_pipeline: vk::Pipeline,
     pub ray_traversal_pipeline_layout: vk::PipelineLayout,
@@ -78,21 +83,29 @@ impl TerrainRenderer {
         vertex_terrain_descriptor_set_layouts: &'a [vk::DescriptorSetLayout],
         texture_descriptor_set_layout: &'a vk::DescriptorSetLayout,
         ray_traversal_descriptor_set_layouts: &'a [vk::DescriptorSetLayout],
+        material_buffer: AllocatedBuffer,
     ) -> Result<Self> {
         let terrain_render_mode = game::settings::GAME_SETTINGS.terrain_render_mode;
+        info!("Terrain render mode: {:?}", terrain_render_mode);
+
         let mut chunk_mesh_pool = VecDeque::new();
         if terrain_render_mode == TerrainRenderMode::Vertex {
-            for _ in 0..render_distance * render_distance * 4 * texture_num {
+            for _ in 0..render_distance * render_distance * 8 * texture_num {
                 // Maximum number of vertices in a chunk
                 let vertex_buffer_size = (16 * 16 * 16 * std::mem::size_of::<Vertex>()) as u64;
 
+                let vertex_usage = if context.use_buffer_device_address {
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_DST
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                } else {
+                    vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER
+                };
                 let vertex_buffer = context.create_buffer(
                     "Vertex buffer",
                     &mut allocator.lock(),
                     vertex_buffer_size,
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    vertex_usage,
                     gpu_allocator::MemoryLocation::GpuOnly,
                 )?;
 
@@ -106,9 +119,13 @@ impl TerrainRenderer {
                 )?;
 
                 let vertex_buffer_address = unsafe {
-                    context.device.get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
-                    )
+                    if context.use_buffer_device_address {
+                        Some(context.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer),
+                        ))
+                    } else {
+                        None
+                    }
                 };
                 chunk_mesh_pool.push_back(AllocatedChunkMesh {
                     index_count: 0,
@@ -124,26 +141,47 @@ impl TerrainRenderer {
         let mut vertex_set_layouts = Vec::new();
         vertex_set_layouts.extend_from_slice(vertex_terrain_descriptor_set_layouts);
         vertex_set_layouts.push(*texture_descriptor_set_layout);
+        let vertex_push_constant_range = if context.use_buffer_device_address {
+            vk::PushConstantRange::default()
+                .offset(0)
+                .size(std::mem::size_of::<VertexTerrainPushConstants>() as u32)
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+        } else {
+            vk::PushConstantRange::default()
+                .offset(0)
+                .size(std::mem::size_of::<LegacyVertexTerrainPushConstants>() as u32)
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+        };
         let vertex_pipeline_layout = unsafe {
             context.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&vertex_set_layouts)
-                    .push_constant_ranges(&[vk::PushConstantRange::default()
-                        .offset(0)
-                        .size(std::mem::size_of::<VertexTerrainPushConstants>() as u32)
-                        .stage_flags(vk::ShaderStageFlags::VERTEX)]),
+                    .push_constant_ranges(&[vertex_push_constant_range]),
                 None,
             )?
         };
+        let bda_vertex_terrain_shader =
+            include_str!(concat!(env!("OUT_DIR"), "/res/shaders/terrain.vert"));
+        let legacy_vertex_terrain_shader =
+            include_str!(concat!(env!("OUT_DIR"), "/res/shaders/terrain_legacy.vert"));
 
-        let vertex_shader = resources::load_shader_module(
-            "shaders/terrain.vert",
-            "terrain.vert",
-            ShaderKind::Vertex,
-            &context.device,
-        )?;
+        let vertex_shader = if context.use_buffer_device_address {
+            resources::load_shader_module(
+                bda_vertex_terrain_shader,
+                "terrain.vert",
+                ShaderKind::Vertex,
+                &context.device,
+            )?
+        } else {
+            resources::load_shader_module(
+                legacy_vertex_terrain_shader,
+                "terrain_legacy.vert",
+                ShaderKind::Vertex,
+                &context.device,
+            )?
+        };
         let fragment_shader = resources::load_shader_module(
-            "shaders/terrain.frag",
+            include_str!(concat!(env!("OUT_DIR"), "/res/shaders/terrain.frag")),
             "terrain.frag",
             ShaderKind::Fragment,
             &context.device,
@@ -158,10 +196,14 @@ impl TerrainRenderer {
             fragment_shader,
             vertex_pipeline_layout,
             Default::default(),
+            swapchain.main_render_pass,
         )?;
 
         let ray_traversal_compute_shader = resources::load_shader_module(
-            "shaders/terrain_traverse.comp",
+            include_str!(concat!(
+                env!("OUT_DIR"),
+                "/res/shaders/terrain_traverse.comp"
+            )),
             "terrain_traverse.comp",
             ShaderKind::Compute,
             &context.device,
@@ -172,12 +214,7 @@ impl TerrainRenderer {
         ray_traversal_descriptors.push(*texture_descriptor_set_layout);
         let ray_traversal_pipeline_layout = unsafe {
             context.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&ray_traversal_descriptors)
-                    .push_constant_ranges(&[vk::PushConstantRange::default()
-                        .offset(0)
-                        .size(std::mem::size_of::<RayTraversalPushConstants>() as u32)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE)]),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&ray_traversal_descriptors),
                 None,
             )?
         };
@@ -210,6 +247,26 @@ impl TerrainRenderer {
                 .destroy_shader_module(ray_traversal_compute_shader, None);
         }
 
+        Ok(Self {
+            material_buffer,
+            ray_traversal_pipeline,
+            ray_traversal_pipeline_layout,
+            terrain_render_mode,
+            context,
+            allocator,
+            world,
+            chunk_message_queue: VecDeque::new(),
+            loaded_chunk_meshes: HashMap::new(),
+            chunk_mesh_pool,
+            vertex_pipeline,
+            vertex_pipeline_layout,
+        })
+    }
+
+    pub fn create_material_buffer(
+        context: Arc<RenderingContext>,
+        allocator: Arc<Mutex<Allocator>>,
+    ) -> Result<AllocatedBuffer> {
         let materials = registry::BLOCK_REGISTRY
             .map
             .iter()
@@ -220,9 +277,7 @@ impl TerrainRenderer {
             "Material buffer",
             &mut allocator.lock(),
             materials_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::GpuOnly,
         )?;
 
@@ -258,27 +313,8 @@ impl TerrainRenderer {
             );
         }
         context.end_immediate_submit()?;
-        let material_buffer_address = unsafe {
-            context.device.get_buffer_device_address(
-                &vk::BufferDeviceAddressInfo::default().buffer(material_buffer.buffer),
-            )
-        };
         context.destroy_buffer(&mut allocator.lock(), &mut staging_buffer);
-        Ok(Self {
-            material_buffer_address,
-            material_buffer,
-            ray_traversal_pipeline,
-            ray_traversal_pipeline_layout,
-            terrain_render_mode,
-            context,
-            allocator,
-            world,
-            chunk_message_queue: VecDeque::new(),
-            loaded_chunk_meshes: HashMap::new(),
-            chunk_mesh_pool,
-            vertex_pipeline,
-            vertex_pipeline_layout,
-        })
+        return Ok(material_buffer);
     }
 
     pub fn receive_chunks(
@@ -321,21 +357,32 @@ impl TerrainRenderer {
                                     break 'outer;
                                 }
 
-                                ring_staging_buffer.transfer(
-                                    self.context.clone(),
-                                    frame.command_buffer,
-                                    vert_allocation?,
-                                    &allocated_chunk_mesh.vertex_buffer,
-                                    vk::PipelineStageFlags2::VERTEX_SHADER,
-                                    vk::AccessFlags2::SHADER_READ,
-                                );
+                                if self.context.use_buffer_device_address {
+                                    ring_staging_buffer.transfer(
+                                        self.context.clone(),
+                                        frame.command_buffer,
+                                        vert_allocation?,
+                                        &allocated_chunk_mesh.vertex_buffer,
+                                        vk::PipelineStageFlags::VERTEX_SHADER,
+                                        vk::AccessFlags::SHADER_READ,
+                                    );
+                                } else {
+                                    ring_staging_buffer.transfer(
+                                        self.context.clone(),
+                                        frame.command_buffer,
+                                        vert_allocation?,
+                                        &allocated_chunk_mesh.vertex_buffer,
+                                        vk::PipelineStageFlags::VERTEX_INPUT,
+                                        vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+                                    );
+                                }
                                 ring_staging_buffer.transfer(
                                     self.context.clone(),
                                     frame.command_buffer,
                                     index_allocation?,
                                     &allocated_chunk_mesh.index_buffer,
-                                    vk::PipelineStageFlags2::VERTEX_SHADER,
-                                    vk::AccessFlags2::SHADER_READ,
+                                    vk::PipelineStageFlags::VERTEX_INPUT,
+                                    vk::AccessFlags::INDEX_READ,
                                 );
                                 allocated_chunk_mesh.material = chunk_mesh.material;
                                 allocated_chunk_mesh.index_count = indices.len() as u32;
@@ -408,20 +455,45 @@ impl TerrainRenderer {
 
                     for (_, allocated_meshes) in self.loaded_chunk_meshes.iter() {
                         for allocated_mesh in allocated_meshes {
-                            let push_constants = VertexTerrainPushConstants {
-                                vertex_buffer: allocated_mesh.vertex_buffer_address,
-                                material_id: allocated_mesh.material,
-                            };
-                            self.context.device.cmd_push_constants(
-                                frame.command_buffer,
-                                self.vertex_pipeline_layout,
-                                vk::ShaderStageFlags::VERTEX,
-                                0,
-                                std::slice::from_raw_parts(
-                                    &push_constants as *const _ as *const u8,
-                                    std::mem::size_of::<VertexTerrainPushConstants>(),
-                                ),
-                            );
+                            if self.context.use_buffer_device_address {
+                                let push_constants = VertexTerrainPushConstants {
+                                    vertex_buffer: allocated_mesh.vertex_buffer_address.unwrap(),
+                                    material_id: allocated_mesh.material,
+                                };
+
+                                self.context.device.cmd_push_constants(
+                                    frame.command_buffer,
+                                    self.vertex_pipeline_layout,
+                                    vk::ShaderStageFlags::VERTEX,
+                                    0,
+                                    std::slice::from_raw_parts(
+                                        &push_constants as *const _ as *const u8,
+                                        std::mem::size_of::<VertexTerrainPushConstants>(),
+                                    ),
+                                );
+                            } else {
+                                let legacy_push_constants = LegacyVertexTerrainPushConstants {
+                                    material_id: allocated_mesh.material,
+                                };
+
+                                self.context.device.cmd_push_constants(
+                                    frame.command_buffer,
+                                    self.vertex_pipeline_layout,
+                                    vk::ShaderStageFlags::VERTEX,
+                                    0,
+                                    std::slice::from_raw_parts(
+                                        &legacy_push_constants as *const _ as *const u8,
+                                        std::mem::size_of::<LegacyVertexTerrainPushConstants>(),
+                                    ),
+                                );
+
+                                self.context.device.cmd_bind_vertex_buffers(
+                                    frame.command_buffer,
+                                    0,
+                                    &[allocated_mesh.vertex_buffer.buffer],
+                                    &[0],
+                                );
+                            }
 
                             self.context.device.cmd_bind_index_buffer(
                                 frame.command_buffer,
@@ -465,6 +537,7 @@ impl TerrainRenderer {
                         &[frame.ray_traversal_descriptors],
                         &[],
                     );
+
                     self.context.device.cmd_bind_descriptor_sets(
                         frame.command_buffer,
                         vk::PipelineBindPoint::COMPUTE,
@@ -473,19 +546,7 @@ impl TerrainRenderer {
                         &[texture_set],
                         &[],
                     );
-                    let push_constants = RayTraversalPushConstants {
-                        material_buffer: self.material_buffer_address,
-                    };
-                    self.context.device.cmd_push_constants(
-                        frame.command_buffer,
-                        self.ray_traversal_pipeline_layout,
-                        vk::ShaderStageFlags::COMPUTE,
-                        0,
-                        std::slice::from_raw_parts(
-                            &push_constants as *const _ as *const u8,
-                            std::mem::size_of::<RayTraversalPushConstants>(),
-                        ),
-                    );
+
                     self.context.device.cmd_dispatch(
                         frame.command_buffer,
                         extent.width.div_ceil(16),
@@ -535,7 +596,8 @@ impl Drop for TerrainRenderer {
                     &mut loaded_chunk_mesh.index_buffer,
                 );
             }
-            self.context.destroy_buffer(&mut self.allocator.lock(), &mut self.material_buffer);
+            self.context
+                .destroy_buffer(&mut self.allocator.lock(), &mut self.material_buffer);
         }
     }
 }

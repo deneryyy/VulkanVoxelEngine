@@ -1,7 +1,6 @@
 #version 460
 
 #extension GL_EXT_nonuniform_qualifier : require
-#extension GL_EXT_buffer_reference : require
 
 layout (local_size_x = 16, local_size_y = 16) in;
 
@@ -23,14 +22,9 @@ struct MaterialPerFace {
     uint zminus;
 };
 
-layout(buffer_reference, std430) readonly buffer MaterialBuffer { 
+layout(std430, set = 0, binding = 2) readonly buffer MaterialBuffer { 
 	MaterialPerFace materials[];
-};
-
-layout( push_constant ) uniform constants
-{	
-	MaterialBuffer materialBuffer;
-} PushConstants;
+} material_buffer;
 
 struct HitResult {
     vec3 position;      
@@ -45,14 +39,16 @@ struct HitResult {
 const float FLT_MAX = 3.4028235e+38;
 
 bool is_solid(ivec3 pos) {
-    if (pos.x > 0 && pos.x < 64 &&
-        pos.z > 0 && pos.z < 64 &&
-        pos.y > 0 && pos.y < 64) {
+    if (pos.x > 0 && pos.x < 16 &&
+        pos.z > 0 && pos.z < 16 &&
+        pos.y > 0 && pos.y < 16) {
         return true;
     }
+    /*
     if (pos.y == 0) {
         return true;
     }
+    */
     
     return false;
 }
@@ -170,14 +166,14 @@ void main()
     vec3 ray_dir = normalize(world_ray.xyz);
     vec3 ray_origin = camera_pos.xyz;
 
-    HitResult hit = trace_dda(ray_origin, ray_dir, 10000, 5000);
+    HitResult hit = trace_dda(ray_origin, ray_dir, 10000, 50);
 
     vec4 color;
     float depth;
     float near_plane = 0.1;
     float far_plane = 1000.0;
     if (hit.hit) {
-        MaterialPerFace materialPerFace = PushConstants.materialBuffer.materials[1];
+        MaterialPerFace materialPerFace = material_buffer.materials[1];
         if (hit.face == 0) {
             color = texture(texSampler[materialPerFace.xplus], hit.uv);
         } else if (hit.face == 1) {

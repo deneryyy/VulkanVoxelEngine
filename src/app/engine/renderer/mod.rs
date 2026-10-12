@@ -26,7 +26,7 @@ use crate::app::{
         terrain::TerrainRenderer,
         texture::Texture,
     },
-    game::world::World,
+    game::{settings::TerrainRenderMode, world::World},
 };
 use ash::vk::{self, CommandBufferUsageFlags};
 
@@ -88,18 +88,24 @@ impl Renderer {
             device: context.device.clone(),
             physical_device: context.physical_device.handle,
             debug_settings: Default::default(),
-            buffer_device_address: true,
+            buffer_device_address: context.use_buffer_device_address,
             allocation_sizes: Default::default(),
         })?));
 
         let mut textures: Vec<Texture> = Vec::new();
-        let grass_texture = Texture::load_texture_from_file(
-            "textures/grass.png",
+        let grass_texture = Texture::load_texture(
+            Vec::from(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/res/textures/grass.png"
+            ))),
             context.clone(),
             &mut allocator.lock(),
         )?;
-        let stone_texture = Texture::load_texture_from_file(
-            "textures/stone.webp",
+        let stone_texture = Texture::load_texture(
+            Vec::from(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/res/textures/stone.webp"
+            ))),
             context.clone(),
             &mut allocator.lock(),
         )?;
@@ -156,6 +162,8 @@ impl Renderer {
             .dst_set(texture_descriptors)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_infos);
+
+        let material_buffer = TerrainRenderer::create_material_buffer(context.clone(), allocator.clone())?;
         unsafe {
             context.device.update_descriptor_sets(&[tex_write], &[]);
             let mut render_finished_semaphores: Vec<vk::Semaphore> =
@@ -232,6 +240,13 @@ impl Renderer {
                     vk::ShaderStageFlags::COMPUTE,
                     vk::DescriptorBindingFlags::empty(),
                 );
+                ray_traversal_descriptor_layout_builder.add_binding(
+                    2,
+                    vk::DescriptorType::STORAGE_BUFFER,
+                    1,
+                    vk::ShaderStageFlags::COMPUTE,
+                    vk::DescriptorBindingFlags::empty(),
+                );
                 let vertex_terrain_descriptor_layout =
                     vertex_terrain_descriptor_layout_builder.build(&context.device)?;
                 let ray_traversal_descriptor_layout =
@@ -285,6 +300,17 @@ impl Renderer {
                         .descriptor_count(1)
                         .buffer_info(rt_uniform_desc_info),
                 );
+                let rt_material_buffer_desc_info = &[vk::DescriptorBufferInfo::default()
+                    .buffer(material_buffer.buffer)
+                    .range(material_buffer.allocation.size())];
+                desc_writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(2)
+                        .dst_set(ray_traversal_descriptors)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(rt_material_buffer_desc_info),
+                );
 
                 context.device.update_descriptor_sets(&desc_writes, &[]);
 
@@ -327,6 +353,7 @@ impl Renderer {
                     &vertex_terrain_descriptor_set_layouts,
                     &texture_descriptor_layout,
                     &ray_traversal_descriptor_set_layouts,
+                    material_buffer
                 )?,
                 texture_descriptor_layout,
                 texture_descriptors,
@@ -441,51 +468,77 @@ impl Renderer {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
             );
 
             self.context.transition_image_layout(
                 frame.command_buffer,
                 self.swapchain.depth_image.image,
                 vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 vk::ImageAspectFlags::DEPTH,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
             );
 
             let extent = vk::Extent2D::default()
                 .width(self.swapchain.draw_image.extent.width)
                 .height(self.swapchain.draw_image.extent.height);
 
-            self.context.begin_rendering(
-                frame.command_buffer,
-                self.swapchain.draw_image.image_view,
-                self.swapchain.depth_image.image_view,
-                vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0],
-                },
-                vk::Rect2D::default().extent(extent),
+            let use_render_pass =
+                self.terrain_renderer.terrain_render_mode == TerrainRenderMode::Vertex;
+            if use_render_pass {
+                self.context.begin_rendering(
+                    frame.command_buffer,
+                    self.swapchain.draw_image.image_view,
+                    self.swapchain.depth_image.image_view,
+                    vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                    vk::Rect2D::default().extent(extent),
+                    self.swapchain.framebuffer,
+                    self.swapchain.main_render_pass,
+                );
+
+                self.context.device.cmd_set_viewport(
+                    frame.command_buffer,
+                    0,
+                    &[vk::Viewport::default()
+                        .width(extent.width as f32)
+                        .height(extent.height as f32)
+                        .min_depth(0.0)
+                        .max_depth(1.0)],
+                );
+
+                self.context.device.cmd_set_scissor(
+                    frame.command_buffer,
+                    0,
+                    &[vk::Rect2D::default().extent(extent)],
+                );
+            }
+
+            self.terrain_renderer.record_commands(
+                frame,
+                &self.frames,
+                extent,
+                &self.swapchain,
+                self.texture_descriptors,
             );
 
-            self.context.device.cmd_set_viewport(
-                frame.command_buffer,
-                0,
-                &[vk::Viewport::default()
-                    .width(extent.width as f32)
-                    .height(extent.height as f32)
-                    .min_depth(0.0)
-                    .max_depth(1.0)],
-            );
-
-            self.context.device.cmd_set_scissor(
-                frame.command_buffer,
-                0,
-                &[vk::Rect2D::default().extent(extent)],
-            );
-
-            self.terrain_renderer
-                .record_commands(frame, &self.frames, extent, &self.swapchain, self.texture_descriptors);
-
-            self.context.device.cmd_end_rendering(frame.command_buffer);
-
+            if use_render_pass {
+                if self.context.use_dynamic_rendering {
+                    self.context.device.cmd_end_rendering(frame.command_buffer);
+                } else {
+                    self.context
+                        .device
+                        .cmd_end_render_pass(frame.command_buffer);
+                }
+            }
             //transition the draw image and the swapchain image into their correct transfer layouts
             self.context.transition_image_layout(
                 frame.command_buffer,
@@ -493,6 +546,10 @@ impl Renderer {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
             );
             self.context.transition_image_layout(
                 frame.command_buffer,
@@ -500,6 +557,10 @@ impl Renderer {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
             );
 
             // execute a copy from the draw image into the swapchain
@@ -520,6 +581,10 @@ impl Renderer {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
                 vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
             );
             self.context
                 .device
@@ -527,21 +592,38 @@ impl Renderer {
 
             let render_finished_semaphore = self.render_finished_semaphores[image_index as usize];
 
-            self.context.device.queue_submit2(
-                self.context.queues[self.context.queue_families.graphics as usize],
-                &[vk::SubmitInfo2::default()
-                    .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                        .semaphore(frame.image_available_semaphore)
-                        .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT_KHR)])
-                    .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                        .semaphore(render_finished_semaphore)
-                        .stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS)])
-                    .command_buffer_infos(&[
-                        vk::CommandBufferSubmitInfo::default().command_buffer(frame.command_buffer)
-                    ])],
-                frame.in_flight_fence,
-            )?;
+            if self.context.use_sync2 {
+                self.context.device.queue_submit2(
+                    self.context.queues[self.context.queue_families.graphics as usize],
+                    &[vk::SubmitInfo2::default()
+                        .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                            .semaphore(frame.image_available_semaphore)
+                            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT_KHR)])
+                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                            .semaphore(render_finished_semaphore)
+                            .stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS)])
+                        .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default()
+                            .command_buffer(frame.command_buffer)])],
+                    frame.in_flight_fence,
+                )?;
+            } else {
+                let wait_semaphores = [frame.image_available_semaphore];
+                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let signal_semaphores = [render_finished_semaphore];
+                let command_buffers = [frame.command_buffer];
 
+                let submit_info = vk::SubmitInfo::default()
+                    .wait_semaphores(&wait_semaphores)
+                    .wait_dst_stage_mask(&wait_stages)
+                    .signal_semaphores(&signal_semaphores)
+                    .command_buffers(&command_buffers);
+
+                self.context.device.queue_submit(
+                    self.context.queues[self.context.queue_families.graphics as usize],
+                    &[submit_info],
+                    frame.in_flight_fence,
+                )?;
+            }
             self.swapchain
                 .present(image_index, render_finished_semaphore)?;
 

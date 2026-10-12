@@ -9,10 +9,6 @@ struct Vertex {
 	float uv2;
 }; 
 
-struct Matrix {
-	mat4 model;
-};
-
 layout(buffer_reference, std430) readonly buffer VertexBuffer { 
 	Vertex vertices[];
 };

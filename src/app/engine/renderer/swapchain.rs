@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ash::vk::{self};
-use gpu_allocator::{
-    vulkan::{Allocator, AllocatorCreateDesc},
-};
+use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use winit::window::Window;
 
 use crate::app::engine::renderer::context::{AllocatedImage, RenderingContext, Surface};
@@ -12,6 +10,8 @@ use std::result::Result::Ok as stdOk;
 
 pub struct Swapchain {
     allocator: Allocator,
+    pub framebuffer: Option<vk::Framebuffer>,
+    pub main_render_pass: Option<vk::RenderPass>,
     pub depth_image: AllocatedImage,
     pub draw_image: AllocatedImage,
     pub desired_image_count: u32,
@@ -53,13 +53,31 @@ impl Swapchain {
             device: context.device.clone(),
             physical_device: context.physical_device.handle,
             debug_settings: Default::default(),
-            buffer_device_address: true,
+            buffer_device_address: context.use_buffer_device_address,
             allocation_sizes: Default::default(),
         })?;
 
         let draw_image = Self::create_draw_image(window.clone(), context.clone(), &mut allocator)?;
         let depth_image =
             Self::create_depth_image(window.clone(), context.clone(), &mut allocator)?;
+
+        let mut main_render_pass = None;
+        if !context.use_dynamic_rendering {
+            main_render_pass = Some(
+                context
+                    .create_main_render_pass(draw_image.image_format, depth_image.image_format)?,
+            );
+        }
+
+        let mut framebuffer = None;
+        if !context.use_dynamic_rendering {
+            framebuffer = Some(context.create_main_framebuffer(
+                draw_image.image_view,
+                depth_image.image_view,
+                extent,
+                main_render_pass,
+            )?);
+        }
 
         Ok(Self {
             allocator,
@@ -68,6 +86,8 @@ impl Swapchain {
             desired_image_count,
             format,
             extent,
+            framebuffer,
+            main_render_pass,
             image_views: Default::default(),
             images: Default::default(),
             handle: Default::default(),
@@ -98,6 +118,10 @@ impl Swapchain {
                     self.context.physical_device.handle,
                     self.surface.handle,
                 )?;
+
+            if let Some(fb) = self.framebuffer.take() {
+                unsafe { self.context.device.destroy_framebuffer(fb, None) };
+            }
 
             let new_swapchain = self.context.swapchain_extension.create_swapchain(
                 &vk::SwapchainCreateInfoKHR::default()
@@ -171,6 +195,16 @@ impl Swapchain {
                 self.context.clone(),
                 &mut self.allocator,
             )?;
+
+            if !self.context.use_dynamic_rendering {
+                let fb = self.context.create_main_framebuffer(
+                    self.draw_image.image_view,
+                    self.depth_image.image_view,
+                    self.extent,
+                    self.main_render_pass,
+                )?;
+                self.framebuffer = Some(fb);
+            }
         }
 
         Ok(())
@@ -263,6 +297,12 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         unsafe {
+            if !self.context.use_dynamic_rendering {
+                self.context.device.destroy_render_pass(self.main_render_pass.unwrap(), None);
+            }
+            if let Some(fb) = self.framebuffer.take() {
+                self.context.device.destroy_framebuffer(fb, None);
+            }
             self.image_views.drain(..).for_each(|image_view| {
                 self.context.device.destroy_image_view(image_view, None);
             });

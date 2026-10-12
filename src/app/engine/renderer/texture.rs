@@ -64,6 +64,10 @@ impl Texture {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ 
             );
             context.device.cmd_copy_buffer_to_image(
                 cmd,
@@ -90,6 +94,10 @@ impl Texture {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ
             );
         }
         context.end_immediate_submit()?;
